@@ -75,11 +75,8 @@ def get_probed_class(target_model):
             self.register_buffer("probe_dirs", loaded_probes.to(torch.float32))
             
             # --- IPC SETUP (FIXED) ---
-            # Slot layout: [num_tokens (uint32), slot_seq (uint64), probe_scores...]
-            # Metadata: 4 bytes (num_tokens) + 8 bytes (slot_seq) = 12 bytes
-            self.metadata_size_bytes = 12
             self.slot_floats = self.num_probes * MAX_TOKENS_PER_BATCH
-            self.slot_size_bytes = self.metadata_size_bytes + (self.slot_floats * 4)
+            self.slot_size_bytes = self.slot_floats * 4 
             if self.slot_size_bytes % 512 != 0:
                 self.slot_size_bytes += (512 - (self.slot_size_bytes % 512))
             
@@ -165,28 +162,9 @@ def get_probed_class(target_model):
             print(">> [HOOK] 🎣 Probe hook called!")
             # Capture the output of the layer
             hidden_states = output[0] if isinstance(output, tuple) else output
-            
-            # Try to extract sequence metadata from the input
-            # In vLLM, input may contain kwargs with sequence info
-            seq_ids = None
-            token_positions = None
-            if isinstance(input, tuple) and len(input) > 0:
-                # Check if input has sequence metadata
-                # vLLM often passes kwargs as part of input
-                try:
-                    # Access the model's forward kwargs if available
-                    if hasattr(module, '_last_forward_kwargs'):
-                        kwargs = module._last_forward_kwargs
-                        if 'seq_ids' in kwargs:
-                            seq_ids = kwargs['seq_ids']
-                        if 'positions' in kwargs:
-                            token_positions = kwargs['positions']
-                except:
-                    pass
-            
-            self._run_probes_logic(hidden_states, seq_ids, token_positions)
+            self._run_probes_logic(hidden_states)
 
-        def _run_probes_logic(self, hidden_states, seq_ids=None, token_positions=None):
+        def _run_probes_logic(self, hidden_states):
             target_device = hidden_states.device
             target_dtype = hidden_states.dtype
 
@@ -197,63 +175,21 @@ def get_probed_class(target_model):
 
             # [FIX] Ensure contiguous memory for C++ kernel
             scores_float = scores.float().contiguous()
-            
-            # Extract batch info
-            batch_size, num_probes = scores_float.shape
-            if len(scores_float.shape) == 3:  # [batch, seq_len, num_probes]
-                batch_size, seq_len, num_probes = scores_float.shape
-                scores_float = scores_float.reshape(-1, num_probes)  # Flatten to [batch*seq_len, num_probes]
-                batch_size = batch_size * seq_len
 
-            print(f">> [PROBE] 🔍 Probing scores: {scores_float.shape}, batch_size: {batch_size}")
+            print(f">> [PROBE] 🔍 Probing scores: {scores_float.shape}")
+            print(f">> [PROBE] 📝 Calling vllm_ipc.write() with {scores_float.numel()} elements")
             
-            # Create metadata: [num_tokens, seq_ids..., token_positions...]
-            # For now, use sequence number (head counter) as seq_id if not available
-            # Token positions default to 0, 1, 2, ... if not available
-            if seq_ids is None:
-                # Use a simple counter - in practice you'd get this from vLLM
-                seq_ids = torch.zeros(batch_size, dtype=torch.int32, device=target_device)
-            if token_positions is None:
-                # Default to sequential positions
-                token_positions = torch.arange(batch_size, dtype=torch.int32, device=target_device)
-            
-            # Ensure metadata is the right size
-            if isinstance(seq_ids, torch.Tensor):
-                seq_ids = seq_ids[:batch_size].to(dtype=torch.int32, device=target_device)
-            else:
-                seq_ids = torch.tensor(seq_ids[:batch_size], dtype=torch.int32, device=target_device)
-                
-            if isinstance(token_positions, torch.Tensor):
-                token_positions = token_positions[:batch_size].to(dtype=torch.int32, device=target_device)
-            else:
-                token_positions = torch.tensor(token_positions[:batch_size], dtype=torch.int32, device=target_device)
-
-            print(f">> [PROBE] 📝 Calling vllm_ipc.write() with {scores_float.numel()} elements, batch_size: {batch_size}")
-            
-            # [DEBUG] Read head value BEFORE kernel call (this will be the slot_seq)
+            # [DEBUG] Read head value BEFORE kernel call
+            # Read first 8 bytes as uint64 from the buffer
             head_view_before = self.ipc_buffer[:8].view(torch.uint64)
             head_before_val = int(head_view_before[0].cpu().item())
-            slot_seq = head_before_val  # Use current head as slot sequence number
-            print(f">> [PROBE] 📊 Head BEFORE: {head_before_val} (slot_seq: {slot_seq})")
-
-            # Prepare metadata: [num_tokens (uint32), slot_seq (uint64 stored as 2 uint32s)]
-            metadata = torch.zeros(3, dtype=torch.int32, device=target_device)  # 3 int32s = 12 bytes (signed for easier casting)
-            metadata[0] = int(batch_size)  # num_tokens
-            # Store slot_seq as two uint32s (little-endian)
-            slot_seq_low = int(slot_seq & 0xFFFFFFFF)
-            slot_seq_high = int((slot_seq >> 32) & 0xFFFFFFFF)
-            metadata[1] = slot_seq_low
-            metadata[2] = slot_seq_high
-            # Convert to uint32 view for kernel
-            metadata_uint32 = metadata.to(torch.uint32)
+            print(f">> [PROBE] 📊 Head BEFORE: {head_before_val}")
 
             vllm_ipc.write(
                 scores_float,
-                metadata_uint32,
                 self.ipc_ptr, 
                 RING_SIZE, 
-                self.slot_size_bytes,
-                self.metadata_size_bytes
+                self.slot_size_bytes
             )
             
             # [DEBUG] Add synchronization to ensure kernel completes

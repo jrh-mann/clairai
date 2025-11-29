@@ -109,38 +109,23 @@ def main():
                 slot_idx = seq % RING_SIZE
                 src_ptr = data_base_ptr + (slot_idx * SLOT_SIZE_BYTES)
                 
-                # Read metadata (first 12 bytes: 3 uint32s)
-                metadata_mem = cp.cuda.UnownedMemory(src_ptr, 12, None)
-                metadata_ptr = cp.cuda.MemoryPointer(metadata_mem, 0)
-                metadata_arr = cp.ndarray((3,), dtype=cp.uint32, memptr=metadata_ptr)
-                metadata = cp.asnumpy(metadata_arr)
-                num_tokens = int(metadata[0])
-                slot_seq_low = int(metadata[1])
-                slot_seq_high = int(metadata[2])
-                slot_seq = slot_seq_low | (slot_seq_high << 32)
-                
-                # Read probe scores (after 12-byte metadata)
-                data_ptr = src_ptr + 12
+                # Copy slot
                 raw_data = cp.ndarray(
-                    shape=((SLOT_SIZE_BYTES - 12) // 4,), dtype=cp.float32,
-                    memptr=cp.cuda.MemoryPointer(cp.cuda.UnownedMemory(data_ptr, SLOT_SIZE_BYTES - 12, None), 0)
+                    shape=(SLOT_SIZE_BYTES // 4,), dtype=cp.float32,
+                    memptr=cp.cuda.MemoryPointer(cp.cuda.UnownedMemory(src_ptr, SLOT_SIZE_BYTES, None), 0)
                 )
                 host_data = cp.asnumpy(raw_data)
                 
                 # Reshape: [MAX_BATCH, NUM_PROBES]
                 reshaped = host_data[:MAX_BATCH*NUM_PROBES].reshape(MAX_BATCH, NUM_PROBES)
                 
-                # Only show rows with actual data (up to num_tokens)
-                active_data = reshaped[:num_tokens] if num_tokens > 0 else reshaped
-                active_mask = np.any(active_data != 0, axis=1) if num_tokens > 0 else np.any(reshaped != 0, axis=1)
-                
+                # Check for non-zeros
+                active_mask = np.any(reshaped != 0, axis=1)
                 if np.any(active_mask):
-                    print(f"[Slot {seq}] 🟢 slot_seq={slot_seq}, num_tokens={num_tokens}, active_rows={np.sum(active_mask)}")
-                    # Show probe scores for first active token
-                    first_active_idx = np.where(active_mask)[0][0] if np.any(active_mask) else 0
-                    print(f"       Token {first_active_idx}: probe_scores = {active_data[first_active_idx, :]}")
+                    print(f"[{seq}] 🟢 Data Found! Rows: {np.sum(active_mask)}")
+                    print(f"       Sample: {reshaped[active_mask][0, :3]}") # Print first 3 floats
                 else:
-                    print(f"[Slot {seq}] 🔴 slot_seq={slot_seq}, num_tokens={num_tokens}, but all zeros")
+                    print(f"[{seq}] 🔴 Slot is all zeros (Kernel might have failed)")
 
             last_seq = curr_seq
         else:
