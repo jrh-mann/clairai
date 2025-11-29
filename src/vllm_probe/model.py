@@ -149,7 +149,6 @@ def get_probed_class(target_model):
             print(f">> [IPC] Test pattern written at offset 8: 0xDEADBEEFCAFEBABE")
 
         def _attach_hook(self):
-            # [FIX] Actually attach the hook to the correct layer
             layers = self.model.layers
             if self.target_layer_idx >= len(layers):
                 raise ValueError(f"Target layer {self.target_layer_idx} out of bounds")
@@ -158,9 +157,7 @@ def get_probed_class(target_model):
             print(f">> [PROBE] 🪝 Hook attached to Layer {self.target_layer_idx}")
 
         def _probe_hook(self, module, input, output):
-            # [DEBUG] Verify hook is being called
-            print(">> [HOOK] 🎣 Probe hook called!")
-            # Capture the output of the layer
+
             hidden_states = output[0] if isinstance(output, tuple) else output
             self._run_probes_logic(hidden_states)
 
@@ -176,35 +173,14 @@ def get_probed_class(target_model):
             # [FIX] Ensure contiguous memory for C++ kernel
             scores_float = scores.float().contiguous()
 
-            print(f">> [PROBE] 🔍 Probing scores: {scores_float.shape}")
-            print(f">> [PROBE] 📝 Calling vllm_ipc.write() with {scores_float.numel()} elements")
-            
-            # [DEBUG] Read head value BEFORE kernel call
-            # Read first 8 bytes as uint64 from the buffer
-            head_view_before = self.ipc_buffer[:8].view(torch.uint64)
-            head_before_val = int(head_view_before[0].cpu().item())
-            print(f">> [PROBE] 📊 Head BEFORE: {head_before_val}")
-
             vllm_ipc.write(
                 scores_float,
-                self.ipc_ptr, 
+                int(self.ipc_ptr),  # Convert to int64 for the C++ binding
                 RING_SIZE, 
                 self.slot_size_bytes
             )
             
             # [DEBUG] Add synchronization to ensure kernel completes
             torch.cuda.synchronize()
-            
-            # [DEBUG] Read head value AFTER kernel call
-            head_view_after = self.ipc_buffer[:8].view(torch.uint64)
-            head_after_val = int(head_view_after[0].cpu().item())
-            delta = head_after_val - head_before_val
-            print(f">> [PROBE] 📊 Head AFTER: {head_after_val} (Delta: {delta})")
-            if delta != 1:
-                print(f">> [PROBE] ⚠️ WARNING: Head should increment by 1, but delta is {delta}!")
-            print(f">> [PROBE] ✅ Kernel write completed")
-
-        # [FIX] Removed the 'forward' override entirely. 
-        # We rely on the hook attached in __init__ now.
 
     return ProbedModel, BaseClass, target_arch_name
