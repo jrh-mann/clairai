@@ -1,6 +1,6 @@
 Benchmarking vLLM endpoint: http://localhost:8000/v1
 Model: default
-Number of requests: 500
+Number of requests: 100
 Concurrent requests: 10
 Max tokens: 256
 Streaming: True
@@ -10,43 +10,43 @@ Streaming: True
 BENCHMARK RESULTS
 ================================================================================
 
-Total Requests: 500
-Successful: 500
+Total Requests: 100
+Successful: 100
 Failed: 0
 
-Total Time: 58.39s
-Total Tokens Generated: 108,623
+Total Time: 87.54s
+Total Tokens Generated: 25,319
 
 --------------------------------------------------------------------------------
 THROUGHPUT (tokens/second)
 --------------------------------------------------------------------------------
-Average:  189.87 tok/s
-P50:      191.91 tok/s
-P95:      200.34 tok/s
-P99:      207.11 tok/s
+Average:  29.09 tok/s
+P50:      29.61 tok/s
+P95:      31.76 tok/s
+P99:      32.67 tok/s
 
 --------------------------------------------------------------------------------
 TIME TO FIRST TOKEN (TTFT)
 --------------------------------------------------------------------------------
-Average:  44.37 ms
-P50:      22.28 ms
-P95:      29.32 ms
-P99:      1147.92 ms
+Average:  296.93 ms
+P50:      65.11 ms
+P95:      2404.42 ms
+P99:      2407.06 ms
 
 --------------------------------------------------------------------------------
 TOTAL REQUEST LATENCY
 --------------------------------------------------------------------------------
-Average:  1.155s
-P50:      1.169s
-P95:      1.505s
-P99:      2.503s
+Average:  8.751s
+P50:      8.515s
+P95:      10.919s
+P99:      10.921s
 
 --------------------------------------------------------------------------------
 OTHER METRICS
 --------------------------------------------------------------------------------
-Avg Tokens per Request: 217.2
-Avg Time per Token: 5.320 ms
-Requests per Second: 8.56
+Avg Tokens per Request: 253.2
+Avg Time per Token: 34.623 ms
+Requests per Second: 1.14
 
 ================================================================================
 

@@ -3,3 +3,4 @@ torch
 numpy
 hf_transfer
 aiohttp
+cupy-cuda12x

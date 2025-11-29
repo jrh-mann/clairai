@@ -1,5 +1,7 @@
+pyproject.toml
 setup.py
 vllm_probe/__init__.py
+vllm_probe/ipc_writer.cu
 vllm_probe/model.py
 vllm_probe.egg-info/PKG-INFO
 vllm_probe.egg-info/SOURCES.txt

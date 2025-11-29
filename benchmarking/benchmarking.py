@@ -445,19 +445,19 @@ async def main():
     parser.add_argument(
         "--num-requests",
         type=int,
-        default=10,
+        default=100,
         help="Number of requests to make (default: 10)"
     )
     parser.add_argument(
         "--concurrent",
         type=int,
-        default=1,
+        default=10,
         help="Number of concurrent requests (default: 1)"
     )
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=512,
+        default=256,
         help="Maximum tokens to generate per request (default: 512)"
     )
     parser.add_argument(

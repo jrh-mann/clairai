@@ -1,6 +1,6 @@
 Benchmarking vLLM endpoint: http://localhost:8000/v1
 Model: default
-Number of requests: 500
+Number of requests: 100
 Concurrent requests: 10
 Max tokens: 256
 Streaming: True
@@ -10,43 +10,43 @@ Streaming: True
 BENCHMARK RESULTS
 ================================================================================
 
-Total Requests: 500
-Successful: 500
+Total Requests: 100
+Successful: 100
 Failed: 0
 
-Total Time: 55.66s
-Total Tokens Generated: 108,554
+Total Time: 84.11s
+Total Tokens Generated: 25,126
 
 --------------------------------------------------------------------------------
 THROUGHPUT (tokens/second)
 --------------------------------------------------------------------------------
-Average:  196.83 tok/s
-P50:      197.56 tok/s
-P95:      205.49 tok/s
-P99:      208.13 tok/s
+Average:  29.88 tok/s
+P50:      29.78 tok/s
+P95:      32.00 tok/s
+P99:      32.48 tok/s
 
 --------------------------------------------------------------------------------
 TIME TO FIRST TOKEN (TTFT)
 --------------------------------------------------------------------------------
-Average:  23.55 ms
-P50:      22.65 ms
-P95:      31.20 ms
-P99:      47.03 ms
+Average:  68.36 ms
+P50:      64.01 ms
+P95:      95.07 ms
+P99:      97.45 ms
 
 --------------------------------------------------------------------------------
 TOTAL REQUEST LATENCY
 --------------------------------------------------------------------------------
-Average:  1.103s
-P50:      1.148s
-P95:      1.458s
-P99:      1.487s
+Average:  8.408s
+P50:      8.402s
+P95:      8.438s
+P99:      8.439s
 
 --------------------------------------------------------------------------------
 OTHER METRICS
 --------------------------------------------------------------------------------
-Avg Tokens per Request: 217.1
-Avg Time per Token: 5.090 ms
-Requests per Second: 8.98
+Avg Tokens per Request: 251.3
+Avg Time per Token: 33.515 ms
+Requests per Second: 1.19
 
 ================================================================================
 
