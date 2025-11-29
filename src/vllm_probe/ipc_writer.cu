@@ -12,7 +12,8 @@ __global__ void write_kernel(
     int feature_dim,                    // Number of floats to copy
     int ring_size,                      // Total number of slots in the ring
     int slot_size_bytes,                // Byte size of one slot
-    uint64_t* write_head_ptr            // Pointer to the monotonic counter
+    uint64_t* write_head_ptr,
+    uint64_t request_id
 ) {
     // 1. READ HEAD (Do not increment yet)
     // We assume a single writer stream (serialized forward pass), so reading 
@@ -23,8 +24,13 @@ __global__ void write_kernel(
     // 2. CALCULATE ADDRESS
     // Layout: [Head(128B)] [Slot 0] [Slot 1] ...
     char* base_char = (char*)ring_base_ptr;
-    // 128 bytes offset for the header
-    float* dst_slot = (float*)(base_char + 128 + (slot_idx * slot_size_bytes));
+
+    char* dst_slot = base_char + 128 + (slot_idx * slot_size_bytes);
+    
+    // Write request_id at the start of the slot (first 8 bytes)
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *((uint64_t*)dst_slot) = request_id;
+    }
 
     // 3. COPY DATA (Grid-Stride Loop)
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < feature_dim; i += blockDim.x * gridDim.x) {
@@ -51,7 +57,8 @@ void launch_ipc_write(
     torch::Tensor src, 
     int64_t ring_base_addr, 
     int ring_size,
-    int slot_size_bytes
+    int slot_size_bytes,
+    uint64_t request_id
 ) {
     int feature_dim = src.numel();
     const float* src_ptr = src.data_ptr<float>();
@@ -71,7 +78,8 @@ void launch_ipc_write(
         feature_dim, 
         ring_size, 
         slot_size_bytes, 
-        head_ptr
+        head_ptr,
+        request_id
     );
 }
 

@@ -109,10 +109,23 @@ def main():
                 slot_idx = seq % RING_SIZE
                 src_ptr = data_base_ptr + (slot_idx * SLOT_SIZE_BYTES)
                 
-                # Copy slot
+                # Read request_id from first 8 bytes of slot
+                cp.cuda.Device().synchronize()
+                cudart = ctypes.CDLL('libcudart.so')
+                host_request_id = (ctypes.c_uint64 * 1)()
+                cudart.cudaMemcpy(
+                    ctypes.byref(host_request_id),
+                    ctypes.c_void_p(src_ptr),
+                    8,
+                    ctypes.c_int(2)  # cudaMemcpyDeviceToHost
+                )
+                request_id = int(host_request_id[0])
+                
+                # Read probe data (offset by 8 bytes for request_id)
+                probe_data_ptr = src_ptr + 8
                 raw_data = cp.ndarray(
-                    shape=(SLOT_SIZE_BYTES // 4,), dtype=cp.float32,
-                    memptr=cp.cuda.MemoryPointer(cp.cuda.UnownedMemory(src_ptr, SLOT_SIZE_BYTES, None), 0)
+                    shape=(SLOT_SIZE_BYTES // 4 - 2,), dtype=cp.float32,  # Subtract 2 for request_id (8 bytes = 2 floats)
+                    memptr=cp.cuda.MemoryPointer(cp.cuda.UnownedMemory(probe_data_ptr, SLOT_SIZE_BYTES - 8, None), 0)
                 )
                 host_data = cp.asnumpy(raw_data)
                 
@@ -122,10 +135,10 @@ def main():
                 # Check for non-zeros
                 active_mask = np.any(reshaped != 0, axis=1)
                 if np.any(active_mask):
-                    print(f"[{seq}] 🟢 Data Found! Rows: {np.sum(active_mask)}")
-                    print(f"       Sample: {reshaped[active_mask][0, :3]}") # Print first 3 floats
+                    print(f"[{seq}] Request ID: {request_id} 🟢 Data Found! Rows: {np.sum(active_mask)}")
+                    print(f"       Sample: {reshaped[active_mask][0, :3]}")
                 else:
-                    print(f"[{seq}] 🔴 Slot is all zeros (Kernel might have failed)")
+                    print(f"[{seq}] Request ID: {request_id} 🔴 Slot is all zeros")
 
             last_seq = curr_seq
         else:

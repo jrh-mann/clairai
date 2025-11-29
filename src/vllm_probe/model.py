@@ -75,11 +75,13 @@ def get_probed_class(target_model):
             self.register_buffer("probe_dirs", loaded_probes.to(torch.float32))
             
             # --- IPC SETUP (FIXED) ---
+            REQUEST_ID_SIZE_BYTES = 8  # uint64 for request_id
             self.slot_floats = self.num_probes * MAX_TOKENS_PER_BATCH
-            self.slot_size_bytes = self.slot_floats * 4 
+            self.slot_data_bytes = self.slot_floats * 4  # Probe data size
+            self.slot_size_bytes = REQUEST_ID_SIZE_BYTES + self.slot_data_bytes
             if self.slot_size_bytes % 512 != 0:
                 self.slot_size_bytes += (512 - (self.slot_size_bytes % 512))
-            
+
             total_bytes = 128 + (RING_SIZE * self.slot_size_bytes)
             
             # 1. Allocate Buffer using cudaMalloc for IPC compatibility
@@ -157,11 +159,17 @@ def get_probed_class(target_model):
             print(f">> [PROBE] 🪝 Hook attached to Layer {self.target_layer_idx}")
 
         def _probe_hook(self, module, input, output):
-
             hidden_states = output[0] if isinstance(output, tuple) else output
-            self._run_probes_logic(hidden_states)
 
-        def _run_probes_logic(self, hidden_states):
+            request_id = 0
+            
+            print(dir(self))
+                
+            print(f">> [PROBE] 📊 Request ID: {request_id}")
+
+            self._run_probes_logic(hidden_states, request_id)
+
+        def _run_probes_logic(self, hidden_states, request_id):
             target_device = hidden_states.device
             target_dtype = hidden_states.dtype
 
@@ -177,7 +185,8 @@ def get_probed_class(target_model):
                 scores_float,
                 int(self.ipc_ptr),  # Convert to int64 for the C++ binding
                 RING_SIZE, 
-                self.slot_size_bytes
+                self.slot_size_bytes,
+                request_id
             )
             
             # [DEBUG] Add synchronization to ensure kernel completes
