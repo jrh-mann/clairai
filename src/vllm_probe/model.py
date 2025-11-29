@@ -10,14 +10,21 @@ TARGET_LAYER = os.environ.get("TARGET_LAYER", None)
 if TARGET_LAYER is None:
     raise ValueError("TARGET_LAYER environment variable is not set")
 
-PROBES_DIR = "/root/clairai/src/probes/llama-3.1-8b"
+PROBE_MODEL = os.environ.get("PROBE_MODEL", None)
+if PROBE_MODEL is None:
+    raise ValueError("PROBE_MODEL environment variable is not set")
+
+PROBES_DIR = "/root/clairai/src/probes"
+
+def hf_name_into_model_name(hf_name: str) -> str:
+    return hf_name.split("/")[-1]
 
 def parse_layer_from_neuronpedia(layer_str: str) -> int:
     """Parse layer number from Neuronpedia format like '19-resid-post-aa'"""
     try:
         # Extract first number from string
-        parts = layer_str.split('-')
-        return int(parts[0])
+        parts = layer_str.split('_')
+        return int(parts[1])
     except:
         return -1
 
@@ -30,34 +37,21 @@ def load_probes_for_layer(layer_idx: int):
     probe_names = []
         
     # Search for ALL .json files (we'll filter by layer inside)
-    json_pattern = os.path.join(PROBES_DIR, "**", "*.json")
-    json_files = glob.glob(json_pattern, recursive=True)
+    path = f"{PROBES_DIR}/{hf_name_into_model_name(PROBE_MODEL)}/"
+    json_files = os.listdir(path)
+
+    print(json_files)
     
     # Load .json files (Neuronpedia format)
     for filepath in sorted(json_files):
         try:
-            with open(filepath, 'r') as f:
+            with open(os.path.join(path, filepath), 'r') as f:
                 data = json.load(f)
             
             # Check if this is a Neuronpedia format file
             if 'vector' not in data:
-                continue
-                
-            # Parse layer from the JSON
-            json_layer = -1
-            if 'layer' in data:
-                json_layer = parse_layer_from_neuronpedia(str(data['layer']))
-            
-            # Also try to get layer from filename (e.g., "19-resid-post")
-            if json_layer == -1:
-                fname = os.path.basename(filepath)
-                json_layer = parse_layer_from_neuronpedia(fname)
-            
-            # Skip if layer doesn't match
-            if json_layer != layer_idx:
-                continue
-            
-            # Convert vector to tensor
+                raise ValueError(f"No vector found in {filepath}")
+                        # Convert vector to tensor
             vector = data['vector']
             tensor = torch.tensor(vector, dtype=torch.float32).unsqueeze(1)  # [dim] -> [dim, 1]
             
@@ -82,7 +76,7 @@ def load_probes_for_layer(layer_idx: int):
         return None, []
     
     # Stack all probes: each is [dim, 1], concatenate along dim 1
-    combined = torch.cat(probe_tensors, dim=1)  # [dim, total_probes]
+    combined = torch.cat(probe_tensors, dim=1)
     print(f">> [PROBE] Combined probe matrix: {combined.shape} ({len(probe_names)} probes)")
     return combined, probe_names
 
@@ -143,7 +137,10 @@ def get_probed_class(target_model):
 
             scores = torch.matmul(hidden_states, self._probe_dirs_casted)
 
-
+            # Store on the model instance (stays on GPU)
+            self.last_probe_scores = scores  # [batch_tokens, num_probes]
+            self.last_input_ids = self.current_input_ids
+            self.last_positions = self.current_positions
 
         def forward(self, *args, **kwargs):
             hidden_states = super().forward(*args, **kwargs)
