@@ -4,3 +4,5 @@ numpy
 hf_transfer
 aiohttp
 cupy-cuda12x
+fastapi
+uvicorn[standard]

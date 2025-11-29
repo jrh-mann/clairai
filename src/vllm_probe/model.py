@@ -7,6 +7,7 @@ import glob
 import json
 import ctypes
 import vllm_ipc  # Ensure this is installed
+from vllm.forward_context import get_forward_context, is_forward_context_available
 
 TARGET_LAYER = int(os.environ.get("TARGET_LAYER", "19"))
 PROBE_MODEL = os.environ.get("PROBE_MODEL", None)
@@ -66,6 +67,8 @@ def get_probed_class(target_model):
         def __init__(self, vllm_config=None, prefix="", **kwargs):
             super().__init__(vllm_config=vllm_config, prefix=prefix, **kwargs)
             self.target_layer_idx = TARGET_LAYER
+
+            self._batch_counter = 0
             
             loaded_probes, probe_names = load_probes_for_layer(self.target_layer_idx)
             if loaded_probes is None:
@@ -75,10 +78,9 @@ def get_probed_class(target_model):
             self.register_buffer("probe_dirs", loaded_probes.to(torch.float32))
             
             # --- IPC SETUP (FIXED) ---
-            REQUEST_ID_SIZE_BYTES = 8  # uint64 for request_id
             self.slot_floats = self.num_probes * MAX_TOKENS_PER_BATCH
             self.slot_data_bytes = self.slot_floats * 4  # Probe data size
-            self.slot_size_bytes = REQUEST_ID_SIZE_BYTES + self.slot_data_bytes
+            self.slot_size_bytes = self.slot_data_bytes
             if self.slot_size_bytes % 512 != 0:
                 self.slot_size_bytes += (512 - (self.slot_size_bytes % 512))
 
@@ -159,37 +161,40 @@ def get_probed_class(target_model):
             print(f">> [PROBE] 🪝 Hook attached to Layer {self.target_layer_idx}")
 
         def _probe_hook(self, module, input, output):
-            hidden_states = output[0] if isinstance(output, tuple) else output
-
-            request_id = 0
+            """Write batch-structured probe data to IPC."""
             
-            print(dir(self))
-                
-            print(f">> [PROBE] 📊 Request ID: {request_id}")
+            hidden_states = output[0] if isinstance(output, tuple) else output
+            ctx = get_forward_context()
 
-            self._run_probes_logic(hidden_states, request_id)
-
-        def _run_probes_logic(self, hidden_states, request_id):
-            target_device = hidden_states.device
-            target_dtype = hidden_states.dtype
-
-            if self._probe_dirs_casted is None or self._probe_dirs_casted.dtype != target_dtype:
-                self._probe_dirs_casted = self.probe_dirs.to(device=target_device, dtype=target_dtype)
-
-            scores = torch.matmul(hidden_states, self._probe_dirs_casted)
-
-            # [FIX] Ensure contiguous memory for C++ kernel
-            scores_float = scores.float().contiguous()
-
-            vllm_ipc.write(
-                scores_float,
-                int(self.ipc_ptr),  # Convert to int64 for the C++ binding
-                RING_SIZE, 
-                self.slot_size_bytes,
-                request_id
+            if not ctx.attn_metadata:
+                return
+            
+            # Get batch structure
+            first_layer_metadata = next(iter(ctx.attn_metadata.values()))
+            query_start_loc_gpu = first_layer_metadata. query_start_loc
+            
+            # Increment batch counter
+            self._batch_counter += 1
+            
+            # Compute probe scores
+            if self._probe_dirs_casted is None or self._probe_dirs_casted.dtype != hidden_states.dtype:
+                self._probe_dirs_casted = self. probe_dirs.to(
+                    device=hidden_states.device, 
+                    dtype=hidden_states. dtype
+                )
+            
+            scores = torch.matmul(hidden_states, self._probe_dirs_casted). float(). contiguous()
+            
+            # Write to IPC - all GPU tensors, no sync! 
+            vllm_ipc.write_batch(
+                self._batch_counter,           # batch_id (int)
+                query_start_loc_gpu,           # [num_requests + 1] GPU tensor
+                scores,                        # [num_tokens, num_probes] GPU tensor  
+                int(self. ipc_ptr),             # ring buffer base address
+                RING_SIZE,
+                self. slot_size_bytes
             )
             
-            # [DEBUG] Add synchronization to ensure kernel completes
-            torch.cuda.synchronize()
-
+            torch.cuda.synchronize()  # Ensure write completes before next iteration
+                    
     return ProbedModel, BaseClass, target_arch_name

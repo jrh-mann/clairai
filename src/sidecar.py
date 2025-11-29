@@ -19,7 +19,6 @@ def main():
     RING_SIZE = meta["ring_size"]
     SLOT_SIZE_BYTES = meta["slot_size_bytes"]
     NUM_PROBES = meta["num_probes"]
-    MAX_BATCH = meta["max_batch"]
     vllm_ptr = meta.get("vllm_ptr", "unknown")
     
     with open(IPC_PATH, "rb") as f:
@@ -109,36 +108,73 @@ def main():
                 slot_idx = seq % RING_SIZE
                 src_ptr = data_base_ptr + (slot_idx * SLOT_SIZE_BYTES)
                 
-                # Read request_id from first 8 bytes of slot
                 cp.cuda.Device().synchronize()
                 cudart = ctypes.CDLL('libcudart.so')
-                host_request_id = (ctypes.c_uint64 * 1)()
+                
+                # Read batch_id (8 bytes at offset 0)
+                host_batch_id = (ctypes.c_uint64 * 1)()
                 cudart.cudaMemcpy(
-                    ctypes.byref(host_request_id),
+                    ctypes.byref(host_batch_id),
                     ctypes.c_void_p(src_ptr),
                     8,
                     ctypes.c_int(2)  # cudaMemcpyDeviceToHost
                 )
-                request_id = int(host_request_id[0])
+                batch_id = int(host_batch_id[0])
                 
-                # Read probe data (offset by 8 bytes for request_id)
-                probe_data_ptr = src_ptr + 8
-                raw_data = cp.ndarray(
-                    shape=(SLOT_SIZE_BYTES // 4 - 2,), dtype=cp.float32,  # Subtract 2 for request_id (8 bytes = 2 floats)
-                    memptr=cp.cuda.MemoryPointer(cp.cuda.UnownedMemory(probe_data_ptr, SLOT_SIZE_BYTES - 8, None), 0)
+                # Read num_requests (4 bytes at offset 8)
+                host_num_requests = (ctypes.c_int32 * 1)()
+                cudart.cudaMemcpy(
+                    ctypes.byref(host_num_requests),
+                    ctypes.c_void_p(src_ptr + 8),
+                    4,
+                    ctypes.c_int(2)
                 )
-                host_data = cp.asnumpy(raw_data)
+                num_requests = int(host_num_requests[0])
                 
-                # Reshape: [MAX_BATCH, NUM_PROBES]
-                reshaped = host_data[:MAX_BATCH*NUM_PROBES].reshape(MAX_BATCH, NUM_PROBES)
+                if num_requests == 0:
+                    continue  # Skip empty slots
                 
-                # Check for non-zeros
-                active_mask = np.any(reshaped != 0, axis=1)
-                if np.any(active_mask):
-                    print(f"[{seq}] Request ID: {request_id} 🟢 Data Found! Rows: {np.sum(active_mask)}")
-                    print(f"       Sample: {reshaped[active_mask][0, :3]}")
-                else:
-                    print(f"[{seq}] Request ID: {request_id} 🔴 Slot is all zeros")
+                # Read query_start_loc (num_requests+1) * 4 bytes at offset 12
+                query_start_loc_size = num_requests + 1
+                host_query_start_loc = (ctypes.c_int32 * query_start_loc_size)()
+                cudart.cudaMemcpy(
+                    ctypes.byref(host_query_start_loc),
+                    ctypes.c_void_p(src_ptr + 12),
+                    query_start_loc_size * 4,
+                    ctypes.c_int(2)
+                )
+                query_start_loc = np.array([int(host_query_start_loc[i]) for i in range(query_start_loc_size)])
+                
+                # Calculate num_tokens from query_start_loc (last element)
+                num_tokens = int(query_start_loc[-1])
+                
+                # Read probe_scores: num_tokens * num_probes * 4 bytes
+                scores_offset = 12 + (query_start_loc_size * 4)
+                scores_size = num_tokens * NUM_PROBES
+                
+                host_scores = (ctypes.c_float * scores_size)()
+                cudart.cudaMemcpy(
+                    ctypes.byref(host_scores),
+                    ctypes.c_void_p(src_ptr + scores_offset),
+                    scores_size * 4,
+                    ctypes.c_int(2)
+                )
+                scores_array = np.array([float(host_scores[i]) for i in range(scores_size)])
+                
+                # Reshape to [num_tokens, num_probes]
+                probe_scores = scores_array.reshape(num_tokens, NUM_PROBES)
+                
+                # Process each request in the batch
+                for req_idx in range(num_requests):
+                    start_token = int(query_start_loc[req_idx])
+                    end_token = int(query_start_loc[req_idx + 1])
+                    request_scores = probe_scores[start_token:end_token]
+                    
+                    if request_scores.size > 0:
+                        avg_score = request_scores.mean()
+                        print(f"[{seq}] Batch ID: {batch_id}, Request {req_idx}: tokens {start_token}-{end_token} | Avg Score: {avg_score:.4f}")
+                    else:
+                        print(f"[{seq}] Batch ID: {batch_id}, Request {req_idx}: empty")
 
             last_seq = curr_seq
         else:

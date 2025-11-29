@@ -29,6 +29,7 @@ class RequestMetrics:
     first_token_timestamp: Optional[float] = None
     last_token_timestamp: Optional[float] = None
     error: Optional[str] = None
+    has_probe_values: bool = False  # Whether probe values were present in response
 
 
 @dataclass
@@ -64,6 +65,10 @@ class BenchmarkResults:
     
     # Request rate
     requests_per_second: float
+    
+    # Probe metrics
+    requests_with_probes: int = 0
+    probe_coverage: float = 0.0  # Percentage of requests with probe values
 
 
 class VLLMBenchmarker:
@@ -72,10 +77,11 @@ class VLLMBenchmarker:
     def __init__(
         self,
         base_url: str = "http://localhost:8000/v1",
-        api_key: Optional[str] = None
+        api_key: Optional[str] = None,
+        model_name: Optional[str] = None
     ):
         self.base_url = base_url.rstrip("/")
-        self.model_name = os.environ.get("PROBE_MODEL")
+        self.model_name = model_name or os.environ.get("PROBE_MODEL") or "default"
         self.api_key = api_key
         self.session: Optional[aiohttp.ClientSession] = None
         
@@ -104,6 +110,7 @@ class VLLMBenchmarker:
         prompt_tokens = 0
         error = None
         usage_info = None
+        has_probe_values = False
         
         headers = {
             "Content-Type": "application/json",
@@ -142,52 +149,110 @@ class VLLMBenchmarker:
                     # For streaming, we need to parse Server-Sent Events
                     content_buffer = ""
                     accumulated_content = ""
-                    async for chunk in response.content.iter_any():
-                        content_buffer += chunk.decode('utf-8', errors='ignore')
-                        
-                        # Process complete lines
-                        while '\n' in content_buffer:
-                            line, content_buffer = content_buffer.split('\n', 1)
-                            line = line.strip()
-                            
-                            if not line or not line.startswith('data: '):
-                                continue
-                            
-                            data_str = line[6:]  # Remove 'data: ' prefix
-                            if data_str == '[DONE]':
-                                continue
-                            
-                            try:
-                                chunk_data = json.loads(data_str)
-                                choices = chunk_data.get('choices', [])
-                                if choices:
-                                    delta = choices[0].get('delta', {})
-                                    content = delta.get('content', '')
-                                    
-                                    if content:
-                                        # Check if this is the first token
-                                        if first_token_time is None:
-                                            first_token_time = time.time()
-                                        
-                                        # Accumulate content for token counting
-                                        accumulated_content += content
-                                        last_token_time = time.time()
+                    has_probe_values = False
+                    usage_info = None
+                    stream_done = False
+                    
+                    try:
+                        # Read streaming response chunk by chunk
+                        content_buffer = ""
+                        async for chunk in response.content.iter_any():
+                            if stream_done:
+                                break
                                 
-                                # Check for usage information (usually in final chunk)
-                                if 'usage' in chunk_data:
-                                    usage_info = chunk_data['usage']
-                            except json.JSONDecodeError:
-                                continue
+                            if chunk:
+                                content_buffer += chunk.decode('utf-8', errors='ignore')
+                            
+                            # Process complete lines from buffer
+                            while '\n' in content_buffer:
+                                line, content_buffer = content_buffer.split('\n', 1)
+                                line = line.strip()
+                                
+                                if not line:
+                                    continue
+                                
+                                if not line.startswith('data: '):
+                                    continue
+                                
+                                data_str = line[6:]  # Remove 'data: ' prefix
+                                if data_str == '[DONE]':
+                                    stream_done = True
+                                    # Process any remaining buffer before breaking
+                                    break
+                                
+                                try:
+                                    chunk_data = json.loads(data_str)
+                                    choices = chunk_data.get('choices', [])
+                                    if choices:
+                                        delta = choices[0].get('delta', {})
+                                        content = delta.get('content', '')
+                                        
+                                        # Check for probe values
+                                        if 'probe_values' in delta:
+                                            has_probe_values = True
+                                        
+                                        if content:
+                                            # Check if this is the first token
+                                            if first_token_time is None:
+                                                first_token_time = time.time()
+                                            
+                                            # Accumulate content for token counting
+                                            accumulated_content += content
+                                            last_token_time = time.time()
+                                    
+                                    # Check for usage information (usually in final chunk)
+                                    if 'usage' in chunk_data:
+                                        usage_info = chunk_data['usage']
+                                except json.JSONDecodeError as e:
+                                    # Skip malformed JSON
+                                    continue
+                            
+                            # If stream is done, break from outer loop
+                            if stream_done:
+                                break
+                        
+                        # Process any remaining content in buffer after stream ends
+                        if content_buffer and not stream_done:
+                            for line in content_buffer.split('\n'):
+                                line = line.strip()
+                                if line and line.startswith('data: '):
+                                    data_str = line[6:]
+                                    if data_str != '[DONE]':
+                                        try:
+                                            chunk_data = json.loads(data_str)
+                                            choices = chunk_data.get('choices', [])
+                                            if choices:
+                                                delta = choices[0].get('delta', {})
+                                                content = delta.get('content', '')
+                                                if content:
+                                                    if first_token_time is None:
+                                                        first_token_time = time.time()
+                                                    accumulated_content += content
+                                                    last_token_time = time.time()
+                                                if 'probe_values' in delta:
+                                                    has_probe_values = True
+                                            if 'usage' in chunk_data:
+                                                usage_info = chunk_data['usage']
+                                        except json.JSONDecodeError:
+                                            pass
+                                
+                    except Exception as e:
+                        error = f"Stream parsing error: {str(e)}"
                     
                     # Use usage info if available, otherwise estimate from content
-                    if usage_info:
+                    if usage_info and usage_info.get('completion_tokens', 0) > 0:
                         prompt_tokens = usage_info.get('prompt_tokens', 0)
                         completion_tokens = usage_info.get('completion_tokens', 0)
+                    elif accumulated_content:
+                        # Estimate tokens: more accurate method
+                        # Average English token is ~4 characters
+                        completion_tokens = max(1, int(len(accumulated_content) / 4))
+                        # For prompt, use word count approximation
+                        prompt_tokens = max(1, int(len(prompt.split()) * 1.3))
                     else:
-                        # Estimate tokens from accumulated content
-                        # Rough approximation: ~1.3 tokens per word for English
+                        # No content received - this is an error case
+                        completion_tokens = 0
                         prompt_tokens = int(len(prompt.split()) * 1.3)
-                        completion_tokens = int(len(accumulated_content.split()) * 1.3)
                         
                 else:
                     # Non-streaming response
@@ -196,6 +261,9 @@ class VLLMBenchmarker:
                     if choices:
                         message = choices[0].get('message', {})
                         content = message.get('content', '')
+                        # Check for probe values
+                        if 'probe_values' in message or 'all_probe_values' in message:
+                            has_probe_values = True
                         completion_tokens = len(content.split())
                         prompt_tokens = len(prompt.split())
                         
@@ -229,7 +297,8 @@ class VLLMBenchmarker:
                 time_per_token=time_per_token,
                 throughput=throughput,
                 first_token_timestamp=first_token_time,
-                last_token_timestamp=last_token_time
+                last_token_timestamp=last_token_time,
+                has_probe_values=has_probe_values
             )
             
         except Exception as e:
@@ -318,6 +387,8 @@ class VLLMBenchmarker:
             return sorted_data[min(index, len(sorted_data) - 1)]
         
         total_tokens = sum(m.completion_tokens for m in successful)
+        requests_with_probes = sum(1 for m in successful if m.has_probe_values)
+        probe_coverage = (requests_with_probes / len(successful) * 100) if successful else 0.0
         
         return BenchmarkResults(
             total_requests=len(metrics),
@@ -350,6 +421,10 @@ class VLLMBenchmarker:
             
             # Request rate
             requests_per_second=len(metrics) / total_time if total_time > 0 else 0.0,
+            
+            # Probe metrics
+            requests_with_probes=requests_with_probes,
+            probe_coverage=probe_coverage,
         )
     
     def print_results(self, results: BenchmarkResults, detailed: bool = False):
@@ -393,6 +468,7 @@ class VLLMBenchmarker:
         print(f"Avg Tokens per Request: {results.avg_tokens_per_request:.1f}")
         print(f"Avg Time per Token: {results.avg_time_per_token*1000:.3f} ms")
         print(f"Requests per Second: {results.requests_per_second:.2f}")
+        print(f"Requests with Probe Values: {results.requests_with_probes}/{results.successful_requests} ({results.probe_coverage:.1f}%)")
         
         print("\n" + "=" * 80 + "\n")
     
@@ -407,6 +483,82 @@ class VLLMBenchmarker:
             json.dump(output, f, indent=2)
         
         print(f"Results saved to {output_file}")
+
+
+def print_comparison(direct_results: BenchmarkResults, proxy_results: BenchmarkResults, direct_metrics: List[RequestMetrics], proxy_metrics: List[RequestMetrics]):
+    """Print side-by-side comparison of direct vLLM vs proxy results."""
+    print("\n" + "=" * 100)
+    print("COMPARISON: Direct vLLM vs Proxy Server")
+    print("=" * 100)
+    
+    def format_diff(direct_val: float, proxy_val: float, unit: str = "", is_lower_better: bool = False) -> str:
+        """Format a comparison value with difference percentage."""
+        if direct_val == 0:
+            return f"{proxy_val:.2f}{unit} (N/A)"
+        diff = ((proxy_val - direct_val) / direct_val) * 100
+        arrow = "↓" if (is_lower_better and diff < 0) or (not is_lower_better and diff > 0) else "↑"
+        color = "better" if arrow == "↓" and is_lower_better or arrow == "↑" and not is_lower_better else "worse"
+        return f"{proxy_val:.2f}{unit} ({diff:+.1f}% {arrow})"
+    
+    print(f"\nTotal Requests: {direct_results.total_requests} (both)")
+    print(f"Successful: Direct={direct_results.successful_requests}, Proxy={proxy_results.successful_requests}")
+    print(f"Failed: Direct={direct_results.failed_requests}, Proxy={proxy_results.failed_requests}")
+    print(f"Total Tokens: Direct={direct_results.total_tokens_generated:,}, Proxy={proxy_results.total_tokens_generated:,}")
+    print(f"Total Time: Direct={direct_results.total_time:.2f}s, Proxy={proxy_results.total_time:.2f}s")
+    
+    print("\n" + "-" * 100)
+    print("THROUGHPUT (tokens/second)")
+    print("-" * 100)
+    print(f"{'Metric':<20} {'Direct vLLM':<25} {'Proxy':<25} {'Difference':<25}")
+    print("-" * 100)
+    print(f"{'Average':<20} {direct_results.avg_throughput:<25.2f} {format_diff(direct_results.avg_throughput, proxy_results.avg_throughput, ' tok/s'):<25}")
+    print(f"{'P50':<20} {direct_results.p50_throughput:<25.2f} {format_diff(direct_results.p50_throughput, proxy_results.p50_throughput, ' tok/s'):<25}")
+    print(f"{'P95':<20} {direct_results.p95_throughput:<25.2f} {format_diff(direct_results.p95_throughput, proxy_results.p95_throughput, ' tok/s'):<25}")
+    print(f"{'P99':<20} {direct_results.p99_throughput:<25.2f} {format_diff(direct_results.p99_throughput, proxy_results.p99_throughput, ' tok/s'):<25}")
+    
+    print("\n" + "-" * 100)
+    print("TIME TO FIRST TOKEN (TTFT) - Lower is Better")
+    print("-" * 100)
+    print(f"{'Metric':<20} {'Direct vLLM':<25} {'Proxy':<25} {'Difference':<25}")
+    print("-" * 100)
+    print(f"{'Average':<20} {direct_results.avg_ttft*1000:<25.2f} ms {format_diff(direct_results.avg_ttft*1000, proxy_results.avg_ttft*1000, ' ms', True):<25}")
+    print(f"{'P50':<20} {direct_results.p50_ttft*1000:<25.2f} ms {format_diff(direct_results.p50_ttft*1000, proxy_results.p50_ttft*1000, ' ms', True):<25}")
+    print(f"{'P95':<20} {direct_results.p95_ttft*1000:<25.2f} ms {format_diff(direct_results.p95_ttft*1000, proxy_results.p95_ttft*1000, ' ms', True):<25}")
+    print(f"{'P99':<20} {direct_results.p99_ttft*1000:<25.2f} ms {format_diff(direct_results.p99_ttft*1000, proxy_results.p99_ttft*1000, ' ms', True):<25}")
+    
+    print("\n" + "-" * 100)
+    print("TOTAL REQUEST LATENCY - Lower is Better")
+    print("-" * 100)
+    print(f"{'Metric':<20} {'Direct vLLM':<25} {'Proxy':<25} {'Difference':<25}")
+    print("-" * 100)
+    print(f"{'Average':<20} {direct_results.avg_total_time:<25.3f}s {format_diff(direct_results.avg_total_time, proxy_results.avg_total_time, 's', True):<25}")
+    print(f"{'P50':<20} {direct_results.p50_total_time:<25.3f}s {format_diff(direct_results.p50_total_time, proxy_results.p50_total_time, 's', True):<25}")
+    print(f"{'P95':<20} {direct_results.p95_total_time:<25.3f}s {format_diff(direct_results.p95_total_time, proxy_results.p95_total_time, 's', True):<25}")
+    print(f"{'P99':<20} {direct_results.p99_total_time:<25.3f}s {format_diff(direct_results.p99_total_time, proxy_results.p99_total_time, 's', True):<25}")
+    
+    print("\n" + "-" * 100)
+    print("OTHER METRICS")
+    print("-" * 100)
+    print(f"{'Metric':<30} {'Direct vLLM':<30} {'Proxy':<30}")
+    print("-" * 100)
+    print(f"{'Avg Tokens per Request':<30} {direct_results.avg_tokens_per_request:<30.1f} {proxy_results.avg_tokens_per_request:<30.1f}")
+    print(f"{'Avg Time per Token':<30} {direct_results.avg_time_per_token*1000:<30.3f} ms {proxy_results.avg_time_per_token*1000:<30.3f} ms")
+    print(f"{'Requests per Second':<30} {direct_results.requests_per_second:<30.2f} {proxy_results.requests_per_second:<30.2f}")
+    print(f"{'Requests with Probes':<30} {direct_results.requests_with_probes}/{direct_results.successful_requests} ({direct_results.probe_coverage:.1f}%) {proxy_results.requests_with_probes}/{proxy_results.successful_requests} ({proxy_results.probe_coverage:.1f}%)")
+    
+    # Calculate overhead
+    print("\n" + "-" * 100)
+    print("PROXY OVERHEAD ANALYSIS")
+    print("-" * 100)
+    ttft_overhead = ((proxy_results.avg_ttft - direct_results.avg_ttft) / direct_results.avg_ttft * 100) if direct_results.avg_ttft > 0 else 0
+    latency_overhead = ((proxy_results.avg_total_time - direct_results.avg_total_time) / direct_results.avg_total_time * 100) if direct_results.avg_total_time > 0 else 0
+    throughput_overhead = ((direct_results.avg_throughput - proxy_results.avg_throughput) / direct_results.avg_throughput * 100) if direct_results.avg_throughput > 0 else 0
+    
+    print(f"TTFT Overhead: {ttft_overhead:+.2f}% ({proxy_results.avg_ttft*1000 - direct_results.avg_ttft*1000:+.2f} ms)")
+    print(f"Latency Overhead: {latency_overhead:+.2f}% ({proxy_results.avg_total_time - direct_results.avg_total_time:+.3f} s)")
+    print(f"Throughput Reduction: {throughput_overhead:+.2f}% ({proxy_results.avg_throughput - direct_results.avg_throughput:+.2f} tok/s)")
+    
+    print("\n" + "=" * 100 + "\n")
 
 
 async def main():
@@ -457,7 +609,7 @@ async def main():
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=256,
+        default=1,
         help="Maximum tokens to generate per request (default: 512)"
     )
     parser.add_argument(
@@ -482,6 +634,23 @@ async def main():
         action="store_true",
         help="Repeat prompts to reach --num-requests count"
     )
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="Compare direct vLLM vs proxy server (requires --direct-url and --proxy-url)"
+    )
+    parser.add_argument(
+        "--direct-url",
+        type=str,
+        default="http://localhost:8000/v1",
+        help="Direct vLLM URL for comparison (default: http://localhost:8000/v1)"
+    )
+    parser.add_argument(
+        "--proxy-url",
+        type=str,
+        default="http://localhost:6969/v1",
+        help="Proxy server URL for comparison (default: http://localhost:6969/v1)"
+    )
     
     args = parser.parse_args()
     
@@ -502,30 +671,99 @@ async def main():
         # Repeat last prompt
         prompts.extend([prompts[-1]] * (args.num_requests - len(prompts)))
     
-    print(f"Benchmarking vLLM endpoint: {args.url}")
-    print(f"Model: {args.model}")
-    print(f"Number of requests: {len(prompts)}")
-    print(f"Concurrent requests: {args.concurrent}")
-    print(f"Max tokens: {args.max_tokens}")
-    print(f"Streaming: {not args.no_stream}")
-    print()
-    
-    async with VLLMBenchmarker(
-        base_url=args.url,
-        api_key=args.api_key
-    ) as benchmarker:
-        results, metrics = await benchmarker.benchmark(
-            prompts=prompts,
-            num_concurrent=args.concurrent,
-            max_tokens=args.max_tokens,
-            temperature=args.temperature,
-            stream=not args.no_stream
-        )
+    if args.compare:
+        # Comparison mode: run both direct and proxy benchmarks
+        print("=" * 100)
+        print("COMPARISON MODE: Direct vLLM vs Proxy Server")
+        print("=" * 100)
+        print(f"Model: {args.model}")
+        print(f"Number of requests: {len(prompts)}")
+        print(f"Concurrent requests: {args.concurrent}")
+        print(f"Max tokens: {args.max_tokens}")
+        print(f"Streaming: {not args.no_stream}")
+        print()
         
-        benchmarker.print_results(results, detailed=True)
+        # Run direct vLLM benchmark
+        print("\n" + "=" * 100)
+        print("BENCHMARKING DIRECT vLLM")
+        print("=" * 100)
+        async with VLLMBenchmarker(
+            base_url=args.direct_url,
+            api_key=args.api_key,
+            model_name=args.model
+        ) as direct_benchmarker:
+            direct_results, direct_metrics = await direct_benchmarker.benchmark(
+                prompts=prompts,
+                num_concurrent=args.concurrent,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                stream=not args.no_stream
+            )
+            direct_benchmarker.print_results(direct_results, detailed=False)
         
+        # Run proxy benchmark
+        print("\n" + "=" * 100)
+        print("BENCHMARKING PROXY SERVER")
+        print("=" * 100)
+        async with VLLMBenchmarker(
+            base_url=args.proxy_url,
+            api_key=args.api_key,
+            model_name=args.model
+        ) as proxy_benchmarker:
+            proxy_results, proxy_metrics = await proxy_benchmarker.benchmark(
+                prompts=prompts,
+                num_concurrent=args.concurrent,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                stream=not args.no_stream
+            )
+            proxy_benchmarker.print_results(proxy_results, detailed=False)
+        
+        # Print comparison
+        print_comparison(direct_results, proxy_results, direct_metrics, proxy_metrics)
+        
+        # Save results if requested
         if args.output:
-            benchmarker.save_results(results, metrics, args.output)
+            output_data = {
+                "direct": {
+                    "summary": asdict(direct_results),
+                    "individual_requests": [asdict(m) for m in direct_metrics]
+                },
+                "proxy": {
+                    "summary": asdict(proxy_results),
+                    "individual_requests": [asdict(m) for m in proxy_metrics]
+                }
+            }
+            with open(args.output, 'w') as f:
+                json.dump(output_data, f, indent=2)
+            print(f"Comparison results saved to {args.output}")
+    else:
+        # Single endpoint benchmark mode
+        print(f"Benchmarking vLLM endpoint: {args.url}")
+        print(f"Model: {args.model}")
+        print(f"Number of requests: {len(prompts)}")
+        print(f"Concurrent requests: {args.concurrent}")
+        print(f"Max tokens: {args.max_tokens}")
+        print(f"Streaming: {not args.no_stream}")
+        print()
+        
+        async with VLLMBenchmarker(
+            base_url=args.url,
+            api_key=args.api_key,
+            model_name=args.model
+        ) as benchmarker:
+            results, metrics = await benchmarker.benchmark(
+                prompts=prompts,
+                num_concurrent=args.concurrent,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                stream=not args.no_stream
+            )
+            
+            benchmarker.print_results(results, detailed=True)
+            
+            if args.output:
+                benchmarker.save_results(results, metrics, args.output)
 
 
 if __name__ == "__main__":
