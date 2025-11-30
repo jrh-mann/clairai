@@ -51,7 +51,7 @@ def load_probes_for_layer(layer_idx: int):
     if not probe_tensors:
         return None, None, []
     
-    return torch.cat(probe_tensors, dim=1), torch.tensor(probe_biases_list, dtype=torch.float32), probe_names
+    return torch.nn.functional.normalize(torch.cat(probe_tensors, dim=1), p=2, dim=0), torch.tensor(probe_biases_list, dtype=torch.float32), probe_names
 
 def get_probed_class(target_model):
     print(f">> [PLUGIN] 🚀 Inspecting architecture for: {target_model}")
