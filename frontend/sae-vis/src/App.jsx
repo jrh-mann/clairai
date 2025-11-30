@@ -196,7 +196,11 @@ export default function App() {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!input.trim() || isLoading) return;
+    console.log("[FRONTEND] handleSubmit called, input:", input, "isLoading:", isLoading);
+    if (!input.trim() || isLoading) {
+      console.log("[FRONTEND] Early return - input empty or loading");
+      return;
+    }
 
     const userMsg = { id: messageIdCounter, role: 'user', content: input };
     const assistantMsgId = messageIdCounter + 1;
@@ -216,90 +220,189 @@ export default function App() {
     setMessages(prev => [...prev, assistantMsg]);
 
     try {
+      console.log("[FRONTEND] Making request to:", PROXY_URL);
       const response = await fetch(PROXY_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model: MODEL_NAME,
           messages: [...messages, userMsg].map(m => ({ role: m.role, content: m.content })),
-          max_tokens: 100 // Short for demo
+          max_tokens: 100,
+          stream: true
         })
       });
 
+      console.log("[FRONTEND] Response status:", response.status, "ok:", response.ok);
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        const errorText = await response.text();
+        console.error("[FRONTEND] Response error:", errorText);
+        throw new Error(`HTTP error! status: ${response.status}: ${errorText}`);
       }
 
+      if (!response.body) {
+        throw new Error("No response body");
+      }
+
+      console.log("[FRONTEND] Starting to read stream");
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
+      let streamDone = false;
 
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          console.log("[FRONTEND] Stream done, buffer remaining:", buffer.length);
+          break;
+        }
 
-        buffer += decoder.decode(value, { stream: true });
+        const chunk = decoder.decode(value, { stream: true });
+        console.log("[FRONTEND] Received chunk:", chunk.substring(0, 100));
+        buffer += chunk;
+        
+        // Process complete lines from buffer
         const lines = buffer.split('\n');
         buffer = lines.pop() || ''; // Keep incomplete line in buffer
 
         for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const dataStr = line.slice(6);
-            if (dataStr === '[DONE]') continue;
+          const trimmed = line.trim();
+          
+          // Skip empty lines
+          if (!trimmed) {
+            continue;
+          }
+          
+          // Check for data: prefix
+          if (!trimmed.startsWith('data: ')) {
+            console.log("[FRONTEND] Line doesn't start with 'data: ':", trimmed.substring(0, 50));
+            continue;
+          }
+          
+          const dataStr = trimmed.slice(6); // Remove "data: " prefix
+          console.log("[FRONTEND] Processing data string:", dataStr.substring(0, 100));
+          
+          // Check for [DONE] marker
+          if (dataStr === '[DONE]') {
+            console.log("[FRONTEND] Received [DONE] marker");
+            streamDone = true;
+            break;
+          }
+          
+          try {
+            const data = JSON.parse(dataStr);
+            console.log("[FRONTEND] Parsed JSON, keys:", Object.keys(data));
             
+            // --- CASE A: PROBE UPDATE (Custom Event) ---
+            if (data.type === 'probe_update') {
+              console.log("[FRONTEND] Processing probe_update");
+              const deltaScores = data.probe_scores; // [n_probes, n_new_tokens]
+              
+              if (deltaScores && deltaScores.length > 0) {
+                console.log("[FRONTEND] Probe update has", deltaScores.length, "probes,", deltaScores[0]?.length, "tokens");
+                setNumProbes(deltaScores.length);
+                
+                setMessages(prev => prev.map(msg => {
+                  if (msg.id !== assistantMsgId) return msg;
+                  
+                  const lastMsg = { ...msg };
+                  
+                  // Initialize scores matrix if empty
+                  if (!lastMsg.scores || lastMsg.scores.length === 0) {
+                    lastMsg.scores = deltaScores;
+                  } else {
+                    // Append new columns to existing rows
+                    lastMsg.scores = lastMsg.scores.map((row, probeIdx) => {
+                      const newCols = deltaScores[probeIdx] || [];
+                      return [...row, ...newCols];
+                    });
+                  }
+                  
+                  return lastMsg;
+                }));
+              }
+              continue;
+            }
+
+            // --- CASE B: STANDARD TEXT TOKEN (OpenAI format) ---
+            if (data.choices?.[0]?.delta?.content) {
+              const tokenText = data.choices[0].delta.content;
+              console.log("[FRONTEND] Processing token text:", JSON.stringify(tokenText));
+              
+              setMessages(prev => prev.map(msg => {
+                if (msg.id !== assistantMsgId) return msg;
+                
+                const lastMsg = { ...msg };
+                
+                // Initialize if needed
+                if (typeof lastMsg.content !== 'string') lastMsg.content = '';
+                if (!Array.isArray(lastMsg.tokens)) lastMsg.tokens = [];
+                
+                lastMsg.content += tokenText;
+                lastMsg.tokens = [...lastMsg.tokens, tokenText];
+                
+                console.log("[FRONTEND] Updated message, total tokens:", lastMsg.tokens.length, "content length:", lastMsg.content.length);
+                return lastMsg;
+              }));
+            } else {
+              console.log("[FRONTEND] No content in delta, choices:", data.choices);
+            }
+          } catch (e) {
+            console.warn("[FRONTEND] Failed to parse SSE data:", dataStr.substring(0, 100), e);
+          }
+        }
+        
+        // Break if we saw [DONE]
+        if (streamDone) {
+          console.log("[FRONTEND] Breaking due to streamDone");
+          break;
+        }
+      }
+      
+      // Process any remaining content in buffer after stream ends
+      if (buffer && !streamDone) {
+        const trimmed = buffer.trim();
+        if (trimmed && trimmed.startsWith('data: ')) {
+          const dataStr = trimmed.slice(6);
+          if (dataStr !== '[DONE]') {
             try {
               const data = JSON.parse(dataStr);
               
-              if (data.type === 'token') {
-                // Stream token in real-time - create new object to trigger React update
-                setMessages(prev => prev.map(msg => 
-                  msg.id === assistantMsgId 
-                    ? {
-                        ...msg,
-                        content: msg.content + data.token,
-                        tokens: [...msg.tokens, data.token]
-                      }
-                    : msg
-                ));
-              } else if (data.type === 'probe_update' || data.type === 'probe_final') {
-                // Incremental or final probe data update
-                if (data.probe_scores) {
-                  // Update global probe count if first run
-                  if (data.probe_scores.length > 0) {
-                    setNumProbes(data.probe_scores.length);
-                  }
-                  
-                  // Update the message in state with new probe data
-                  setMessages(prev => prev.map(msg => 
-                    msg.id === assistantMsgId 
-                      ? {
-                          ...msg,
-                          scores: data.probe_scores
-                        }
-                      : msg
-                  ));
+              // Handle probe update
+              if (data.type === 'probe_update' && data.probe_scores) {
+                const deltaScores = data.probe_scores;
+                if (deltaScores && deltaScores.length > 0) {
+                  setNumProbes(deltaScores.length);
+                  setMessages(prev => prev.map(msg => {
+                    if (msg.id !== assistantMsgId) return msg;
+                    const lastMsg = { ...msg };
+                    if (!lastMsg.scores || lastMsg.scores.length === 0) {
+                      lastMsg.scores = deltaScores;
+                    } else {
+                      lastMsg.scores = lastMsg.scores.map((row, probeIdx) => {
+                        const newCols = deltaScores[probeIdx] || [];
+                        return [...row, ...newCols];
+                      });
+                    }
+                    return lastMsg;
+                  }));
                 }
-              } else if (data.type === 'done') {
-                // Final message - ensure we have latest probe data
-                if (data.probe_scores && data.probe_scores.length > 0) {
-                  setNumProbes(data.probe_scores.length);
-                }
-                
-                // Final update
-                setMessages(prev => prev.map(msg => 
-                  msg.id === assistantMsgId 
-                    ? {
-                        ...msg,
-                        content: data.content || msg.content,
-                        tokens: data.tokens || msg.tokens,
-                        scores: data.probe_scores || msg.scores || []
-                      }
-                    : msg
-                ));
               }
-            } catch (e) {
-              // Skip malformed JSON
-              console.warn('Failed to parse SSE data:', dataStr);
+              
+              // Handle text token
+              if (data.choices?.[0]?.delta?.content) {
+                const tokenText = data.choices[0].delta.content;
+                setMessages(prev => prev.map(msg => {
+                  if (msg.id !== assistantMsgId) return msg;
+                  const lastMsg = { ...msg };
+                  if (typeof lastMsg.content !== 'string') lastMsg.content = '';
+                  if (!Array.isArray(lastMsg.tokens)) lastMsg.tokens = [];
+                  lastMsg.content += tokenText;
+                  lastMsg.tokens = [...lastMsg.tokens, tokenText];
+                  return lastMsg;
+                }));
+              }
+            } catch (err) {
+              console.warn("[FRONTEND] JSON Parse Error on final buffer:", err);
             }
           }
         }
@@ -414,8 +517,8 @@ export default function App() {
                   msg.content
                 ) : (
                   <div className="font-mono text-sm">
-                    {/* If we have probe data, render tokens. Else plain text. */}
-                    {msg.tokens && msg.tokens.length > 0 ? (
+                    {/* If we have tokens with probe data, render with heatmap. Otherwise show plain content. */}
+                    {msg.tokens && msg.tokens.length > 0 && msg.scores && msg.scores.length > 0 ? (
                       <div className="flex flex-wrap items-baseline content-start gap-y-1">
                         {msg.tokens.map((token, tIdx) => (
                           <TokenRenderer
@@ -431,7 +534,11 @@ export default function App() {
                         ))}
                       </div>
                     ) : (
-                      <span>{msg.content}</span>
+                      msg.content ? (
+                        <span>{msg.content}</span>
+                      ) : (
+                        <span className="animate-pulse text-gray-400">Thinking...</span>
+                      )
                     )}
                   </div>
                 )}

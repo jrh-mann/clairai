@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { Send, Settings, Activity, Cpu } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts';
-import { clsx, type ClassValue } from 'clsx';
+import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
 // --- UTILS ---
@@ -159,45 +159,241 @@ export default function App() {
     if (!input.trim() || isLoading) return;
 
     const userMsg = { role: 'user', content: input };
-    setMessages(prev => [...prev, userMsg]);
+    const assistantMsg = {
+      role: 'assistant',
+      content: '',
+      tokens: [],
+      scores: [] // shape: [n_probes][n_tokens]
+    };
+    
+    // Add both messages in a single state update
+    setMessages(prev => [...prev, userMsg, assistantMsg]);
     setInput("");
     setIsLoading(true);
 
     try {
+      console.log("[FRONTEND DEBUG] Making request to:", PROXY_URL);
+      console.log("[FRONTEND DEBUG] Request payload:", {
+        model: MODEL_NAME,
+        messages: [...messages, userMsg].map(m => ({ role: m.role, content: m.content })),
+        max_tokens: 100,
+        stream: true
+      });
+      
       const response = await fetch(PROXY_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model: MODEL_NAME,
           messages: [...messages, userMsg].map(m => ({ role: m.role, content: m.content })),
-          max_tokens: 100 // Short for demo
+          max_tokens: 100,
+          stream: true // Enable streaming
         })
       });
 
-      const data = await response.json();
-      
-      let assistantMsg = {
-        role: 'assistant',
-        content: data.choices[0].message.content,
-        tokens: [],
-        scores: []
-      };
+      console.log("[FRONTEND DEBUG] Response status:", response.status, "ok:", response.ok);
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error("[FRONTEND DEBUG] Response error:", errorText);
+        throw new Error(`HTTP ${response.status}: ${errorText}`);
+      }
 
-      if (data.token_strings && data.probe_scores) {
-        // backend returns scores shape: [n_probes, n_tokens]
-        assistantMsg.tokens = data.token_strings;
-        assistantMsg.scores = data.probe_scores;
+      if (!response.body) throw new Error("No response body");
+
+      console.log("[FRONTEND DEBUG] Starting to read stream");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let streamDone = false;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          console.log("[FRONTEND DEBUG] Stream done, buffer remaining:", buffer.length);
+          break;
+        }
+
+        const chunk = decoder.decode(value, { stream: true });
+        console.log("[FRONTEND DEBUG] Received chunk:", chunk.substring(0, 100));
+        buffer += chunk;
         
-        // Update global probe count if first run
-        if (data.probe_scores.length > 0) {
-          setNumProbes(data.probe_scores.length);
+        // Process complete lines from buffer
+        // Split on newlines and process each line
+        const lines = buffer.split('\n');
+        // Keep the last incomplete line in buffer
+        buffer = lines.pop() || "";
+        
+        for (const line of lines) {
+          const trimmed = line.trim();
+          
+          // Skip empty lines
+          if (!trimmed) {
+            console.log("[FRONTEND DEBUG] Skipping empty line");
+            continue;
+          }
+          
+          // Check for data: prefix
+          if (!trimmed.startsWith("data: ")) {
+            console.log("[FRONTEND DEBUG] Line doesn't start with 'data: ':", trimmed.substring(0, 50));
+            continue;
+          }
+          
+          const dataStr = trimmed.slice(6); // Remove "data: " prefix
+          console.log("[FRONTEND DEBUG] Processing data string:", dataStr.substring(0, 100));
+          
+          // Check for [DONE] marker
+          if (dataStr === "[DONE]") {
+            console.log("[FRONTEND DEBUG] Received [DONE] marker");
+            streamDone = true;
+            break; // Break out of for loop
+          }
+
+          try {
+            const data = JSON.parse(dataStr);
+            console.log("[FRONTEND DEBUG] Parsed JSON, keys:", Object.keys(data));
+
+            // --- CASE A: PROBE UPDATE (Custom Event) ---
+            if (data.type === "probe_update") {
+              console.log("[FRONTEND DEBUG] Processing probe_update");
+              const deltaScores = data.probe_scores; // [n_probes, n_new_tokens]
+              
+              if (deltaScores && deltaScores.length > 0) {
+                 console.log("[FRONTEND DEBUG] Probe update has", deltaScores.length, "probes,", deltaScores[0]?.length, "tokens");
+                 setNumProbes(deltaScores.length);
+                 
+                 setMessages(prev => {
+                   const newHistory = [...prev];
+                   // Ensure we have an assistant message
+                   if (newHistory.length === 0 || newHistory[newHistory.length - 1].role !== 'assistant') {
+                     console.warn("[FRONTEND DEBUG] No assistant message found for probe update, creating one");
+                     newHistory.push({
+                       role: 'assistant',
+                       content: '',
+                       tokens: [],
+                       scores: []
+                     });
+                   }
+                   
+                   const lastMsg = { ...newHistory[newHistory.length - 1] };
+                   
+                   // Initialize scores matrix if empty
+                   if (!lastMsg.scores || lastMsg.scores.length === 0) {
+                     lastMsg.scores = deltaScores;
+                   } else {
+                     // Append new columns to existing rows
+                     lastMsg.scores = lastMsg.scores.map((row, probeIdx) => {
+                       const newCols = deltaScores[probeIdx] || [];
+                       return [...row, ...newCols];
+                     });
+                   }
+                   
+                   newHistory[newHistory.length - 1] = lastMsg;
+                   return newHistory;
+                 });
+              }
+              continue;
+            }
+
+            // --- CASE B: STANDARD TEXT TOKEN ---
+            if (data.choices?.[0]?.delta?.content) {
+              const tokenText = data.choices[0].delta.content;
+              console.log("[FRONTEND DEBUG] Processing token text:", JSON.stringify(tokenText));
+              
+              setMessages(prev => {
+                const newHistory = [...prev];
+                // Make sure we have an assistant message to update
+                if (newHistory.length === 0 || newHistory[newHistory.length - 1].role !== 'assistant') {
+                  console.warn("[FRONTEND DEBUG] No assistant message found, creating one");
+                  newHistory.push({
+                    role: 'assistant',
+                    content: '',
+                    tokens: [],
+                    scores: []
+                  });
+                }
+                
+                const lastMsg = { ...newHistory[newHistory.length - 1] };
+                
+                // Initialize if needed
+                if (typeof lastMsg.content !== 'string') lastMsg.content = '';
+                if (!Array.isArray(lastMsg.tokens)) lastMsg.tokens = [];
+                
+                lastMsg.content += tokenText;
+                lastMsg.tokens = [...lastMsg.tokens, tokenText];
+                
+                console.log("[FRONTEND DEBUG] Updated message, total tokens:", lastMsg.tokens.length, "content length:", lastMsg.content.length);
+                newHistory[newHistory.length - 1] = lastMsg;
+                return newHistory;
+              });
+            } else {
+              console.log("[FRONTEND DEBUG] No content in delta, choices:", data.choices);
+            }
+
+          } catch (err) {
+            console.warn("[FRONTEND DEBUG] JSON Parse Error on chunk:", dataStr.substring(0, 100), err);
+          }
+        }
+        
+        // Break if we saw [DONE]
+        if (streamDone) {
+          console.log("[FRONTEND DEBUG] Breaking due to streamDone");
+          break; // Break out of while loop
+        }
+      }
+      
+      // Process any remaining content in buffer after stream ends
+      if (buffer && !streamDone) {
+        const trimmed = buffer.trim();
+        if (trimmed && trimmed.startsWith("data: ")) {
+          const dataStr = trimmed.slice(6);
+          if (dataStr !== "[DONE]") {
+            try {
+              const data = JSON.parse(dataStr);
+              
+              // Handle probe update
+              if (data.type === "probe_update" && data.probe_scores) {
+                const deltaScores = data.probe_scores;
+                if (deltaScores && deltaScores.length > 0) {
+                  setNumProbes(deltaScores.length);
+                  setMessages(prev => {
+                    const newHistory = [...prev];
+                    const lastMsg = { ...newHistory[newHistory.length - 1] };
+                    if (!lastMsg.scores || lastMsg.scores.length === 0) {
+                      lastMsg.scores = deltaScores;
+                    } else {
+                      lastMsg.scores = lastMsg.scores.map((row, probeIdx) => {
+                        const newCols = deltaScores[probeIdx] || [];
+                        return [...row, ...newCols];
+                      });
+                    }
+                    newHistory[newHistory.length - 1] = lastMsg;
+                    return newHistory;
+                  });
+                }
+              }
+              
+              // Handle text token
+              if (data.choices?.[0]?.delta?.content) {
+                const tokenText = data.choices[0].delta.content;
+                setMessages(prev => {
+                  const newHistory = [...prev];
+                  const lastMsg = { ...newHistory[newHistory.length - 1] };
+                  lastMsg.content += tokenText;
+                  lastMsg.tokens = [...(lastMsg.tokens || []), tokenText];
+                  newHistory[newHistory.length - 1] = lastMsg;
+                  return newHistory;
+                });
+              }
+            } catch (err) {
+              console.warn("JSON Parse Error on final buffer:", err);
+            }
+          }
         }
       }
 
-      setMessages(prev => [...prev, assistantMsg]);
     } catch (err) {
       console.error(err);
-      setMessages(prev => [...prev, { role: 'assistant', content: "Error connecting to Proxy." }]);
+      setMessages(prev => [...prev, { role: 'assistant', content: "\n[Connection Error]" }]);
     } finally {
       setIsLoading(false);
     }
@@ -210,7 +406,8 @@ export default function App() {
     if (!lastMessage || !lastMessage.scores || lastMessage.scores.length === 0) return [];
     
     // Transform from [n_probes, n_tokens] -> Array of { index, probe0, probe1... }
-    const numTokens = lastMessage.tokens.length;
+    // Note: Use tokens length or scores length (scores[0].length)
+    const numTokens = lastMessage.scores[0].length;
     const chartData = [];
 
     for (let t = 0; t < numTokens; t++) {
@@ -228,7 +425,7 @@ export default function App() {
   const currentMaxScore = useMemo(() => {
     if (!lastMessage || !lastMessage.scores) return 1;
     const probeRow = lastMessage.scores[selectedProbe];
-    if (!probeRow) return 1;
+    if (!probeRow || probeRow.length === 0) return 1;
     return Math.max(...probeRow);
   }, [lastMessage, selectedProbe]);
 
@@ -291,15 +488,15 @@ export default function App() {
                 msg.content
               ) : (
                 <div className="font-mono text-sm">
-                  {/* If we have probe data, render tokens. Else plain text. */}
-                  {msg.tokens && msg.tokens.length > 0 ? (
+                  {/* If we have tokens with probe data, render with heatmap. Otherwise show plain content. */}
+                  {msg.tokens && msg.tokens.length > 0 && msg.scores && msg.scores.length > 0 ? (
                     <div className="flex flex-wrap items-baseline content-start gap-y-1">
                       {msg.tokens.map((token, tIdx) => (
                         <TokenRenderer
                           key={tIdx}
                           text={token}
                           index={tIdx}
-                          score={msg.scores[selectedProbe]?.[tIdx] || 0}
+                          score={msg.scores?.[selectedProbe]?.[tIdx] || 0}
                           maxScore={currentMaxScore}
                           hoveredIndex={hoveredTokenIndex}
                           setHoveredIndex={setHoveredTokenIndex}
@@ -307,7 +504,11 @@ export default function App() {
                       ))}
                     </div>
                   ) : (
-                    msg.content
+                    msg.content ? (
+                      <span>{msg.content}</span>
+                    ) : (
+                      <span className="animate-pulse text-gray-400">Thinking...</span>
+                    )
                   )}
                 </div>
               )}

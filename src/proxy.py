@@ -265,9 +265,12 @@ def get_stream_delta(root_id: Optional[int], prompt_len_est: int, last_sent_coun
 
 @app.post("/v1/chat/completions")
 async def proxy_chat_completions(request: Request):
+    print(f"[PROXY DEBUG] Received chat completion request")
     try:
         body = await request.json()
-    except:
+        print(f"[PROXY DEBUG] Request body keys: {list(body.keys())}")
+    except Exception as e:
+        print(f"[PROXY DEBUG] Error parsing JSON: {e}")
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     body["stream"] = True 
@@ -276,6 +279,7 @@ async def proxy_chat_completions(request: Request):
     messages = body.get("messages", [])
     prompt_text = " ".join([m.get("content", "") for m in messages])
     prompt_len_est = len(prompt_text) // 4
+    print(f"[PROXY DEBUG] Prompt length estimate: {prompt_len_est} tokens, messages: {len(messages)}")
 
     async def generate():
         gen_token_count = 0
@@ -284,19 +288,41 @@ async def proxy_chat_completions(request: Request):
         last_sent_probe_count = 0
         matched_root_id = None
         
+        print(f"[PROXY DEBUG] Starting stream generation for request")
+        
         try:
             async with client.stream("POST", VLLM_URL, json=body) as resp:
+                print(f"[PROXY DEBUG] vLLM response status: {resp.status_code}")
                 if resp.status_code != 200:
-                    yield f"data: {json.dumps({'error': 'vLLM Error'})}\n\n"
+                    error_msg = f"data: {json.dumps({'error': 'vLLM Error'})}\n\n"
+                    print(f"[PROXY DEBUG] vLLM error, yielding: {error_msg[:100]}")
+                    yield error_msg
                     return
 
                 async for line in resp.aiter_lines():
+                    print(f"[PROXY DEBUG] Received line from vLLM: {line[:100]}...")
+                    
                     if line.startswith("data: ") and line != "data: [DONE]":
                         try:
+                            # Parse to check what we got
+                            data_str = line[6:]  # Remove "data: " prefix
+                            try:
+                                parsed_data = json.loads(data_str)
+                                has_content = bool(parsed_data.get("choices", [{}])[0].get("delta", {}).get("content"))
+                                print(f"[PROXY DEBUG] Parsed data - has_content: {has_content}, keys: {list(parsed_data.keys())}")
+                                if has_content:
+                                    token_text = parsed_data["choices"][0]["delta"]["content"]
+                                    print(f"[PROXY DEBUG] Token text: {repr(token_text)}")
+                            except json.JSONDecodeError as je:
+                                print(f"[PROXY DEBUG] JSON decode error: {je}")
+                            
                             # 1. Forward Text Token
-                            yield f"{line}\n\n"
+                            yield_line = f"{line}\n\n"
+                            print(f"[PROXY DEBUG] Yielding line to client: {yield_line[:100]}...")
+                            yield yield_line
                             
                             gen_token_count += 1
+                            print(f"[PROXY DEBUG] Token count: {gen_token_count}")
                             
                             # 2. Opportunistic Probe Update (Non-blocking)
                             # Only try to fetch probes every few tokens to save CPU
@@ -311,32 +337,40 @@ async def proxy_chat_completions(request: Request):
                                     # Calculate how many tokens this delta represents
                                     # delta_scores is [n_probes, n_tokens]
                                     num_new_tokens = len(delta_scores[0])
+                                    print(f"[PROXY DEBUG] Sending probe update: {num_new_tokens} new tokens, {len(delta_scores)} probes")
                                     
                                     probe_chunk = {
                                         "type": "probe_update",
                                         "probe_scores": delta_scores, # DELTA ONLY
                                         "token_count": last_sent_probe_count + num_new_tokens
                                     }
-                                    yield f"data: {json.dumps(probe_chunk)}\n\n"
+                                    probe_line = f"data: {json.dumps(probe_chunk)}\n\n"
+                                    print(f"[PROXY DEBUG] Yielding probe update: {probe_line[:150]}...")
+                                    yield probe_line
                                     
                                     last_sent_probe_count += num_new_tokens
                                     
-                        except Exception: 
+                        except Exception as e: 
+                            print(f"[PROXY DEBUG] Exception in token processing: {e}", exc_info=True)
                             pass # Don't kill the stream if probe logic hiccups
                     
                     if line == "data: [DONE]":
+                        print(f"[PROXY DEBUG] Received [DONE] marker")
                         break
                         
         except Exception as e:
+            print(f"[PROXY DEBUG] Exception in generate(): {e}", exc_info=True)
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
             return
 
         # 3. Final Flush (Ensure we got everything)
         # Wait a tick for IPC to catch the very last token
+        print(f"[PROXY DEBUG] Stream complete, total tokens: {gen_token_count}, final flush...")
         await asyncio.sleep(0.01)
         _, final_delta = get_stream_delta(matched_root_id, 0, last_sent_probe_count)
         
         if final_delta:
+            print(f"[PROXY DEBUG] Sending final probe delta: {len(final_delta[0])} tokens")
             final_chunk = {
                 "type": "probe_update",
                 "probe_scores": final_delta,
@@ -344,6 +378,7 @@ async def proxy_chat_completions(request: Request):
             }
             yield f"data: {json.dumps(final_chunk)}\n\n"
 
+        print(f"[PROXY DEBUG] Yielding [DONE] marker")
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(
