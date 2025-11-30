@@ -23,7 +23,7 @@ META_PATH = "/tmp/vllm_probe_meta.json"
 MAX_BUFFER_AGE_SEC = 30  # Cleanup unmatched streams after 30s
 
 # --- SHARED STATE ---
-# Stores: root_id -> {'tokens': deque([arrays]), 'last_update': timestamp}
+# Stores: root_id -> {'tokens': deque([arrays]), 'total_len': int, 'last_update': timestamp}
 probe_buffer: Dict[int, Dict] = {}
 buffer_lock = threading.Lock()
 
@@ -74,7 +74,7 @@ class IPCMonitor(threading.Thread):
             curr_seq = read_head()
             
             if curr_seq == last_seq:
-                time.sleep(0.001) # 1ms poll interval
+                time.sleep(0.0005) # Hyper-fast poll (0.5ms)
                 continue
                 
             # Handle ring buffer wrap
@@ -83,7 +83,6 @@ class IPCMonitor(threading.Thread):
             for seq in range(start, curr_seq):
                 slot_idx = seq % RING_SIZE
                 src_ptr = int(data_base_ptr + (slot_idx * SLOT_SIZE_BYTES))
-                cp.cuda.Device().synchronize()
                 
                 # --- READ METADATA (Batch Info + IDs) ---
                 # Read BatchID (8) + NumReqs (4)
@@ -113,7 +112,7 @@ class IPCMonitor(threading.Thread):
                 self.cudart.cudaMemcpy(ctypes.byref(h_scores), ctypes.c_void_p(src_ptr + 12 + ids_count*4 + qsl_count*4), scores_floats * 4, 2)
                 
                 # Convert to numpy (Zero-copy from the C-types buffer)
-                # We copy here to detach from the ring buffer so we can store it
+                # Copy is essential to detach from ring buffer
                 scores_np = np.ctypeslib.as_array(h_scores).reshape(num_tokens, NUM_PROBES).copy()
                 
                 # --- PROCESS STREAMS ---
@@ -126,40 +125,35 @@ class IPCMonitor(threading.Thread):
                         start_t = h_qsl[i]
                         end_t = h_qsl[i+1]
                         
-                        # Empty slot check
                         if start_t >= end_t: continue
 
                         # Chain Link Logic
                         if curr_block not in active_links:
                             if prev_block in active_links:
-                                # Transition A -> B: Inherit Root ID
                                 active_links[curr_block] = active_links.pop(prev_block)
                             else:
-                                # New Stream
                                 active_links[curr_block] = curr_block # Root is itself
                         
                         root_id = active_links[curr_block]
                         
                         # Store Data
                         if root_id not in probe_buffer:
-                            probe_buffer[root_id] = {'tokens': [], 'last_update': now}
+                            probe_buffer[root_id] = {'tokens': deque(), 'total_len': 0, 'last_update': now}
                         
-                        # Extract this request's slice
                         req_slice = scores_np[start_t:end_t]
                         probe_buffer[root_id]['tokens'].append(req_slice)
+                        probe_buffer[root_id]['total_len'] += (end_t - start_t)
                         probe_buffer[root_id]['last_update'] = now
 
             last_seq = curr_seq
             
-            # --- GARBAGE COLLECTION (Every ~100 updates) ---
-            if curr_seq % 100 == 0:
+            # --- GARBAGE COLLECTION ---
+            if curr_seq % 500 == 0:
                 self.cleanup()
 
     def cleanup(self):
-        """Remove streams older than MAX_BUFFER_AGE_SEC"""
         now = time.time()
         with buffer_lock:
-            # Create list to avoid modifying while iterating
             to_remove = [k for k, v in probe_buffer.items() 
                          if now - v['last_update'] > MAX_BUFFER_AGE_SEC]
             for k in to_remove:
@@ -170,25 +164,22 @@ class IPCMonitor(threading.Thread):
 # -----------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     monitor = IPCMonitor()
     monitor.start()
     yield
-    # Shutdown
     monitor.running = False
 
 app = FastAPI(lifespan=lifespan)
 
-# Add CORS middleware to handle preflight OPTIONS requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173", "http://127.0.0.1:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-client = httpx.AsyncClient(timeout=120.0)
+client = httpx.AsyncClient(timeout=120.0, limits=httpx.Limits(max_keepalive_connections=20, max_connections=200))
 
 @app.get("/v1/models")
 async def proxy_models():
@@ -196,57 +187,81 @@ async def proxy_models():
     try:
         vllm_models_url = VLLM_URL.replace("/chat/completions", "/models")
         response = await client.get(vllm_models_url)
-        if response.status_code == 200:
-            return JSONResponse(content=response.json())
-        else:
-            return JSONResponse(status_code=response.status_code, content={"error": "vLLM Error"})
+        return JSONResponse(content=response.json(), status_code=response.status_code)
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Upstream connection failed: {str(e)}"})
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
-def find_matching_stream(gen_count: int, prompt_len_est: int, pop: bool = False) -> Tuple[Optional[int], Optional[np.ndarray]]:
+def get_stream_delta(root_id: Optional[int], prompt_len_est: int, last_sent_count: int) -> Tuple[Optional[int], Optional[List[List[float]]]]:
     """
-    Finds the probe stream that best matches the request dimensions.
-    Returns: (root_id, probe_data) where probe_data is shape (n_probes, n_output_tokens) OR (None, None)
-    If pop=True, removes the stream from buffer. Otherwise, leaves it for incremental updates.
+    Efficiently fetches ONLY the new tokens since `last_sent_count`.
+    Complexity: O(New_Tokens) instead of O(Total_Tokens).
     """
-    best_root = None
-    best_score = float('inf')
-    
     with buffer_lock:
-        candidates = list(probe_buffer.keys())
-        
-        for root_id in candidates:
-            stream_data = probe_buffer[root_id]['tokens']
-            total_probe_tokens = sum(len(chunk) for chunk in stream_data)
-            calc_prefill = total_probe_tokens - gen_count
+        # A. If we don't have a root_id yet, find the best match
+        if root_id is None:
+            best_score = float('inf')
+            candidates = list(probe_buffer.keys())
+            for rid in candidates:
+                # Heuristic: Match based on length proximity to prompt length
+                # We assume the stream started recently, so total_len should be close to current gen_count
+                total_len = probe_buffer[rid]['total_len']
+                
+                # Check if stream is viable (has enough data to be the one)
+                if total_len > 0:
+                     # A match is likely if the buffer length roughly matches where we expect to be
+                     # For the first token, total_len is small.
+                    score = abs(total_len - prompt_len_est) 
+                    # Refined match: Prefer larger buffers that are close to prompt+gen
+                    if score < best_score:
+                        best_score = score
+                        root_id = rid
             
-            if calc_prefill >= 0 and calc_prefill < 2048:
-                score = abs(calc_prefill - prompt_len_est)
-                if score < best_score:
-                    best_score = score
-                    best_root = root_id
-        
-        if best_root is not None:
-            data_chunks = probe_buffer[best_root]['tokens'] if not pop else probe_buffer.pop(best_root)['tokens']
-            
-            full_matrix = np.concatenate(data_chunks, axis=0)
-            
-            if gen_count > 0 and len(full_matrix) >= gen_count:
-                output_matrix = full_matrix[-gen_count:]
-            elif gen_count > 0:
-                # Not enough tokens yet, return what we have
-                output_matrix = full_matrix
-            else:
-                output_matrix = np.empty((0, full_matrix.shape[1]))
+            # If no good match found or empty, return None
+            if root_id is None or root_id not in probe_buffer:
+                return None, None
 
-            return best_root, output_matrix.T.tolist()
+        # B. We have a root_id, check for new data
+        stream_info = probe_buffer[root_id]
+        current_total_len = stream_info['total_len']
+        
+        # If no new data
+        if current_total_len <= last_sent_count:
+            return root_id, None
             
-    return None, None
+        # C. Extract Delta (Zero-Copy Logic)
+        # We need to skip the first `last_sent_count` tokens and take the rest.
+        # Since 'tokens' is a deque of chunks, we iterate to find the start point.
+        
+        delta_arrays = []
+        tokens_scanned = 0
+        needed_start = last_sent_count
+        
+        for chunk in stream_info['tokens']:
+            chunk_len = len(chunk)
+            chunk_end = tokens_scanned + chunk_len
+            
+            # If this chunk is entirely in the past, skip it
+            if chunk_end <= needed_start:
+                tokens_scanned += chunk_len
+                continue
+                
+            # If this chunk contains new data
+            start_in_chunk = max(0, needed_start - tokens_scanned)
+            
+            # Append slice (numpy view, cheap)
+            delta_arrays.append(chunk[start_in_chunk:])
+            tokens_scanned += chunk_len
+            
+        if not delta_arrays:
+            return root_id, None
 
-def match_stream(gen_count: int, prompt_len_est: int) -> Optional[np.ndarray]:
-    """Legacy wrapper that pops the stream."""
-    _, result = find_matching_stream(gen_count, prompt_len_est, pop=True)
-    return result
+        # D. Concatenate ONLY the new data and convert to list
+        # We do the heavy lifting (tolist) OUTSIDE this function if possible,
+        # but here we are inside lock. To minimize lock time, we could copy.
+        # However, for delta (small N), concatenation is fast.
+        delta_matrix = np.concatenate(delta_arrays, axis=0)
+        
+        return root_id, delta_matrix.T.tolist()
 
 @app.post("/v1/chat/completions")
 async def proxy_chat_completions(request: Request):
@@ -255,110 +270,80 @@ async def proxy_chat_completions(request: Request):
     except:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # 1. Always stream to count tokens accurately
     body["stream"] = True 
     
-    # 2. Estimate Prompt Length (for matching)
+    # Heuristic for matching: prompt length in tokens (approx)
     messages = body.get("messages", [])
     prompt_text = " ".join([m.get("content", "") for m in messages])
     prompt_len_est = len(prompt_text) // 4
 
     async def generate():
-        full_content = ""
         gen_token_count = 0
-        token_strings = []
-        last_probe_update = 0
-        matched_root_id = None  # Track which stream we matched
+        # Track how much probe data we have successfully sent to the client
+        # This allows us to send only DELTAS (Efficiency Gain)
+        last_sent_probe_count = 0
+        matched_root_id = None
         
         try:
             async with client.stream("POST", VLLM_URL, json=body) as resp:
                 if resp.status_code != 200:
-                    error_msg = json.dumps({"error": "vLLM Error"})
-                    yield f"data: {error_msg}\n\n"
+                    yield f"data: {json.dumps({'error': 'vLLM Error'})}\n\n"
                     return
 
-                # Stream tokens as they arrive
                 async for line in resp.aiter_lines():
                     if line.startswith("data: ") and line != "data: [DONE]":
                         try:
-                            chunk = json.loads(line[6:])
-                            delta = chunk['choices'][0].get('delta') or chunk['choices'][0].get('message')
-                            if delta and delta.get('content'):
-                                content = delta['content']
-                                full_content += content
-                                gen_token_count += 1
-                                token_strings.append(content)
+                            # 1. Forward Text Token
+                            yield f"{line}\n\n"
+                            
+                            gen_token_count += 1
+                            
+                            # 2. Opportunistic Probe Update (Non-blocking)
+                            # Only try to fetch probes every few tokens to save CPU
+                            if gen_token_count % 3 == 0:
+                                matched_root_id, delta_scores = get_stream_delta(
+                                    matched_root_id, 
+                                    prompt_len_est + gen_token_count, 
+                                    last_sent_probe_count
+                                )
                                 
-                                # Stream token to frontend immediately
-                                token_chunk = {
-                                    "type": "token",
-                                    "token": content,
-                                    "index": gen_token_count - 1
-                                }
-                                yield f"data: {json.dumps(token_chunk)}\n\n"
-                                
-                                # Try to get probe data incrementally (every 5 tokens or after initial delay)
-                                if gen_token_count >= 5 and (gen_token_count - last_probe_update >= 5 or gen_token_count == 5):
-                                    await asyncio.sleep(0.005)  # Brief wait for IPC
+                                if delta_scores:
+                                    # Calculate how many tokens this delta represents
+                                    # delta_scores is [n_probes, n_tokens]
+                                    num_new_tokens = len(delta_scores[0])
                                     
-                                    # Try incremental matching (don't pop, just peek)
-                                    root_id, probe_scores = find_matching_stream(gen_token_count, prompt_len_est, pop=False)
+                                    probe_chunk = {
+                                        "type": "probe_update",
+                                        "probe_scores": delta_scores, # DELTA ONLY
+                                        "token_count": last_sent_probe_count + num_new_tokens
+                                    }
+                                    yield f"data: {json.dumps(probe_chunk)}\n\n"
                                     
-                                    if root_id is not None and probe_scores is not None:
-                                        if matched_root_id is None:
-                                            matched_root_id = root_id
-                                        
-                                        # Only send if we have data for current token count
-                                        if probe_scores and len(probe_scores[0]) >= gen_token_count:
-                                            # Trim to current token count
-                                            trimmed_scores = [row[:gen_token_count] for row in probe_scores]
-                                            
-                                            probe_chunk = {
-                                                "type": "probe_update",
-                                                "probe_scores": trimmed_scores,
-                                                "token_count": gen_token_count
-                                            }
-                                            yield f"data: {json.dumps(probe_chunk)}\n\n"
-                                            last_probe_update = gen_token_count
-                        except: pass
+                                    last_sent_probe_count += num_new_tokens
+                                    
+                        except Exception: 
+                            pass # Don't kill the stream if probe logic hiccups
                     
-                    # Forward [DONE] marker
                     if line == "data: [DONE]":
                         break
                         
         except Exception as e:
-            error_msg = json.dumps({"error": f"Upstream connection failed: {str(e)}"})
-            yield f"data: {error_msg}\n\n"
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
             return
 
-        # Wait briefly for IPC to catch up
+        # 3. Final Flush (Ensure we got everything)
+        # Wait a tick for IPC to catch the very last token
         await asyncio.sleep(0.01)
-
-        # Find & Attach Final Probe Data (more accurate match)
-        probe_data = match_stream(gen_token_count, prompt_len_est)
+        _, final_delta = get_stream_delta(matched_root_id, 0, last_sent_probe_count)
         
-        # If we got better data from final match, send it
-        if probe_data and matched_root_id:
-            final_probe_chunk = {
-                "type": "probe_final",
-                "probe_scores": probe_data,
-                "token_count": gen_token_count
+        if final_delta:
+            final_chunk = {
+                "type": "probe_update",
+                "probe_scores": final_delta,
+                "token_count": last_sent_probe_count + len(final_delta[0])
             }
-            yield f"data: {json.dumps(final_probe_chunk)}\n\n"
+            yield f"data: {json.dumps(final_chunk)}\n\n"
 
-        # Send final message
-        final_payload = {
-            "type": "done",
-            "content": full_content,
-            "tokens": token_strings,
-            "probe_scores": probe_data,
-            "usage": {
-                "prompt_tokens": prompt_len_est,
-                "completion_tokens": gen_token_count,
-                "total_tokens": prompt_len_est + gen_token_count
-            }
-        }
-        yield f"data: {json.dumps(final_payload)}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(
@@ -367,10 +352,10 @@ async def proxy_chat_completions(request: Request):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
+            "X-Accel-Buffering": "no", # Disable Nginx buffering if present
         }
     )
 
 if __name__ == "__main__":
-    print("🚀 Starting vLLM Probe Proxy on port 6969...")
-    print(f"   Targeting vLLM at: {VLLM_URL}")
-    uvicorn.run(app, host="0.0.0.0", port=6969)
+    print("🚀 Starting Hyper-Optimized vLLM Proxy...")
+    uvicorn.run(app, host="0.0.0.0", port=6969, log_level="error")

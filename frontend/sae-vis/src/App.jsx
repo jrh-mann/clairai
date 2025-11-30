@@ -22,7 +22,8 @@ const TokenRenderer = ({
   maxScore, 
   index, 
   hoveredIndex, 
-  setHoveredIndex
+  setHoveredIndex,
+  selectedProbe
 }) => {
   // Calculate intensity (0 to 1). SAE features are ReLU (positive).
   // We use a non-linear scaling (sqrt) to make lower values more visible.
@@ -33,22 +34,48 @@ const TokenRenderer = ({
   // r=16, g=185, b=129 is roughly emerald-500
   const backgroundColor = `rgba(16, 185, 129, ${intensity * 0.8})`; 
   
+  const [showTooltip, setShowTooltip] = useState(false);
+  
   return (
     <span
-      onMouseEnter={() => setHoveredIndex(index)}
-      onMouseLeave={() => setHoveredIndex(null)}
-      className={cn(
-        "inline-block px-0.5 rounded transition-colors duration-75 cursor-crosshair border-b-2",
-        hoveredIndex === index 
-          ? "border-black bg-yellow-200" // Hover style overrides heat map
-          : "border-transparent"
-      )}
-      style={{ 
-        backgroundColor: hoveredIndex === index ? undefined : backgroundColor,
-        minWidth: text === " " ? "0.25em" : undefined
+      className="relative inline-block"
+      onMouseEnter={() => {
+        setHoveredIndex(index);
+        setShowTooltip(true);
+      }}
+      onMouseLeave={() => {
+        setHoveredIndex(null);
+        setShowTooltip(false);
       }}
     >
-      {text}
+      <span
+        className={cn(
+          "inline-block px-0.5 rounded transition-colors duration-75 cursor-crosshair border-b-2",
+          hoveredIndex === index 
+            ? "border-black bg-yellow-200" // Hover style overrides heat map
+            : "border-transparent"
+        )}
+        style={{ 
+          backgroundColor: hoveredIndex === index ? undefined : backgroundColor,
+          minWidth: text === " " ? "0.25em" : undefined
+        }}
+      >
+        {text}
+      </span>
+      
+      {/* Tooltip */}
+      {showTooltip && (
+        <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 z-50 pointer-events-none">
+          <div className="bg-black text-white text-xs px-3 py-2 rounded shadow-lg whitespace-nowrap">
+            <div>Token {index}</div>
+            <div>Probe {selectedProbe}: {(score ?? 0).toFixed(4)}</div>
+          </div>
+          {/* Arrow */}
+          <div className="absolute top-full left-1/2 transform -translate-x-1/2 -mt-1">
+            <div className="border-4 border-transparent border-t-black"></div>
+          </div>
+        </div>
+      )}
     </span>
   );
 };
@@ -79,18 +106,29 @@ const ProbeGraph = ({ data, selectedProbe, hoveredIndex, setHoveredIndex, numPro
           }}
           onMouseLeave={() => setHoveredIndex(null)}
         >
-          <XAxis dataKey="index" hide />
-          <YAxis hide domain={[0, 'auto']} />
+          <XAxis 
+            dataKey="index" 
+            hide 
+          />
+          <YAxis 
+            domain={[0, 'auto']}
+            label={{ value: 'Activation', angle: -90, position: 'insideLeft', style: { textAnchor: 'middle', fontSize: '12px', fill: '#666' } }}
+            style={{ fontSize: '11px' }}
+            width={60}
+          />
           <Tooltip 
             trigger="hover"
             content={({ active, payload, label }) => {
               if (active && payload && payload.length) {
-                // Find selected probe value
-                const val = payload.find(p => p.name === `Probe ${selectedProbe}`)?.value;
+                // Find selected probe value - the dataKey is "probe{selectedProbe}"
+                const probeKey = `probe${selectedProbe}`;
+                const selectedPayload = payload.find(p => p.dataKey === probeKey || p.name === probeKey);
+                const val = selectedPayload?.value ?? selectedPayload?.payload?.[probeKey];
+                
                 return (
-                  <div className="bg-black text-white text-xs p-2 rounded shadow-lg">
-                    <p>Token: {label}</p>
-                    <p>Probe {selectedProbe}: {val?.toFixed(4)}</p>
+                  <div className="bg-black text-white text-xs px-3 py-2 rounded shadow-lg">
+                    <div className="font-semibold mb-1">Token {label}</div>
+                    <div>Probe {selectedProbe}: {val !== undefined && val !== null ? Number(val).toFixed(4) : 'N/A'}</div>
                   </div>
                 );
               }
@@ -116,7 +154,8 @@ const ProbeGraph = ({ data, selectedProbe, hoveredIndex, setHoveredIndex, numPro
           {/* Render Selected Probe */}
           <Line 
             type="monotone" 
-            dataKey={`probe${selectedProbe}`} 
+            dataKey={`probe${selectedProbe}`}
+            name={`probe${selectedProbe}`}
             stroke="#10b981" 
             strokeWidth={2} 
             dot={false}
@@ -387,6 +426,7 @@ export default function App() {
                             maxScore={currentMaxScore}
                             hoveredIndex={effectiveHoveredIndex}
                             setHoveredIndex={isLastAssistantMessage ? setHoveredTokenIndex : () => {}}
+                            selectedProbe={selectedProbe}
                           />
                         ))}
                       </div>

@@ -15,7 +15,6 @@ def register_plugin():
     # Register under the ARCHITECTURE name (e.g. Qwen2ForCausalLM)
     # This allows vLLM to find our class even if we wrapped a fallback class (Llama)
     ModelRegistry.register_model(TargetArch, ProbedClass)
-        
     print(f">> [PLUGIN] 🎯 Hijacked {TargetArch} (using {BaseClass.__name__} base)")
         
     return ProbedClass, BaseClass, TargetArch

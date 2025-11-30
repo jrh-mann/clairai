@@ -213,12 +213,28 @@ class VLLMBenchmarker:
                                 
                                 try:
                                     chunk_data = json.loads(data_str)
+                                    
+                                    # Check for proxy.py custom probe format
+                                    chunk_type = chunk_data.get('type', '')
+                                    if chunk_type in ['probe_update', 'probe_final']:
+                                        if 'probe_scores' in chunk_data and chunk_data['probe_scores']:
+                                            has_probe_values = True
+                                    elif chunk_type == 'done':
+                                        # Final payload with probe_scores
+                                        if 'probe_scores' in chunk_data and chunk_data['probe_scores']:
+                                            has_probe_values = True
+                                    elif chunk_type == 'token':
+                                        # Token chunk, check if it has probe data
+                                        if 'probe_scores' in chunk_data and chunk_data['probe_scores']:
+                                            has_probe_values = True
+                                    
+                                    # Check for standard OpenAI format
                                     choices = chunk_data.get('choices', [])
                                     if choices:
                                         delta = choices[0].get('delta', {})
                                         content = delta.get('content', '')
                                         
-                                        # Check for probe values
+                                        # Check for probe values in standard format
                                         if 'probe_values' in delta:
                                             has_probe_values = True
                                         
@@ -230,6 +246,10 @@ class VLLMBenchmarker:
                                             # Accumulate content for token counting
                                             accumulated_content += content
                                             last_token_time = time.time()
+                                    
+                                    # Check for probe_scores at top level (proxy.py format)
+                                    if 'probe_scores' in chunk_data and chunk_data['probe_scores']:
+                                        has_probe_values = True
                                     
                                     # Check for usage information (usually in final chunk)
                                     if 'usage' in chunk_data:
@@ -251,6 +271,17 @@ class VLLMBenchmarker:
                                     if data_str != '[DONE]':
                                         try:
                                             chunk_data = json.loads(data_str)
+                                            
+                                            # Check for proxy.py custom probe format
+                                            chunk_type = chunk_data.get('type', '')
+                                            if chunk_type in ['probe_update', 'probe_final']:
+                                                if 'probe_scores' in chunk_data and chunk_data['probe_scores']:
+                                                    has_probe_values = True
+                                            elif chunk_type == 'done':
+                                                if 'probe_scores' in chunk_data and chunk_data['probe_scores']:
+                                                    has_probe_values = True
+                                            
+                                            # Check for standard OpenAI format
                                             choices = chunk_data.get('choices', [])
                                             if choices:
                                                 delta = choices[0].get('delta', {})
@@ -262,6 +293,11 @@ class VLLMBenchmarker:
                                                     last_token_time = time.time()
                                                 if 'probe_values' in delta:
                                                     has_probe_values = True
+                                            
+                                            # Check for probe_scores at top level
+                                            if 'probe_scores' in chunk_data and chunk_data['probe_scores']:
+                                                has_probe_values = True
+                                            
                                             if 'usage' in chunk_data:
                                                 usage_info = chunk_data['usage']
                                         except json.JSONDecodeError:
@@ -297,6 +333,9 @@ class VLLMBenchmarker:
                             has_probe_values = True
                         # Also check for probe_scores at top level (proxy.py format)
                         if 'probe_scores' in data and data['probe_scores'] is not None:
+                            has_probe_values = True
+                        # Check for proxy.py custom format with type field
+                        if data.get('type') == 'done' and 'probe_scores' in data and data['probe_scores']:
                             has_probe_values = True
                         completion_tokens = len(content.split())
                         prompt_tokens = len(prompt.split())
@@ -610,7 +649,7 @@ async def main():
     parser.add_argument(
         "--url",
         type=str,
-        default="http://localhost:8000/v1",
+        default="http://localhost:6969/v1",
         help="Base URL of the vLLM endpoint (default: http://localhost:8000/v1)"
     )
     parser.add_argument(

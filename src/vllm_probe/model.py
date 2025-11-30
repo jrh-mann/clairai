@@ -22,6 +22,7 @@ def hf_name_into_model_name(hf_name: str) -> str:
 def load_probes_for_layer(layer_idx: int):
     # (Same loading logic as before, abbreviated for clarity)
     probe_tensors = []
+    probe_biases_list = []
     probe_names = []
     
     path = f"{PROBES_DIR}/{hf_name_into_model_name(PROBE_MODEL)}/"
@@ -29,7 +30,7 @@ def load_probes_for_layer(layer_idx: int):
     try:
         json_files = sorted(os.listdir(path))
     except FileNotFoundError:
-        return None, []
+        return None, None, []
 
     for filepath in json_files:
         if not filepath.endswith('.json'): continue
@@ -40,15 +41,17 @@ def load_probes_for_layer(layer_idx: int):
                 vector = data['vector']
                 tensor = torch.tensor(vector, dtype=torch.float32).unsqueeze(1)
                 probe_tensors.append(tensor)
+                bias = data.get("encoder_bias", 0.0)
+                probe_biases_list.append(bias)
                 # Naive naming
                 probe_names.append(f"probe_{len(probe_names)}")
         except:
             continue
     
     if not probe_tensors:
-        return None, []
+        return None, None, []
     
-    return torch.cat(probe_tensors, dim=1), probe_names
+    return torch.cat(probe_tensors, dim=1), torch.tensor(probe_biases_list, dtype=torch.float32), probe_names
 
 def get_probed_class(target_model):
     print(f">> [PLUGIN] 🚀 Inspecting architecture for: {target_model}")
@@ -70,12 +73,13 @@ def get_probed_class(target_model):
 
             self._batch_counter = 0
             
-            loaded_probes, probe_names = load_probes_for_layer(self.target_layer_idx)
+            loaded_probes, loaded_biases, probe_names = load_probes_for_layer(self.target_layer_idx)
             if loaded_probes is None:
                 raise ValueError(f"No probes found for layer {self.target_layer_idx}")
 
             self.num_probes = loaded_probes.shape[1]
             self.register_buffer("probe_dirs", loaded_probes.to(torch.float32))
+            self.register_buffer("probe_biases", loaded_biases.to(torch.float32))
             
             # --- IPC SETUP (FIXED) ---
             self.slot_floats = self.num_probes * MAX_TOKENS_PER_BATCH
@@ -239,24 +243,22 @@ def get_probed_class(target_model):
                     device=hidden_states.device, 
                     dtype=hidden_states.dtype
                 )
-            
-            # Matmul: [total_tokens, hidden_dim] @ [hidden_dim, num_probes]
-            scores = torch.matmul(hidden_states, self._probe_dirs_casted).float().contiguous()
-            
-            # 7. Write to IPC Ring Buffer
-            # Note: This function signature must match your C++ extension
-            vllm_ipc.write_batch(
-                self._batch_counter,           # Sequence ID
-                query_start_loc_gpu,           # Token boundaries
-                stable_ids,                    # <--- NEW: [num_reqs, 2] Chain IDs
-                scores,                        # Probe Scores
-                int(self.ipc_ptr),             # Ring Buffer Pointer
-                RING_SIZE,                     
+                
+            # CALL THE FUSED KERNEL
+            # No intermediate Python lines. No gaps.
+            vllm_ipc.fused_forward(
+                hidden_states,
+                self._probe_dirs_casted,
+                self.probe_biases,      # Pass the bias tensor!
+                self._batch_counter,
+                query_start_loc_gpu,
+                stable_ids,
+                int(self.ipc_ptr),
+                RING_SIZE,
                 self.slot_size_bytes
             )
-            
-            # 8. Synchronize
-            # Essential to ensure data is written before the memory is overwritten next pass
-            torch.cuda.synchronize()
+
+            # Increment (Python side)
+            self._batch_counter += 1
                     
     return ProbedModel, BaseClass, target_arch_name
