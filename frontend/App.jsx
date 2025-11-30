@@ -176,7 +176,7 @@ export default function App() {
       console.log("[FRONTEND DEBUG] Request payload:", {
         model: MODEL_NAME,
         messages: [...messages, userMsg].map(m => ({ role: m.role, content: m.content })),
-        max_tokens: 100,
+        max_tokens: 10000,
         stream: true
       });
       
@@ -186,7 +186,7 @@ export default function App() {
         body: JSON.stringify({
           model: MODEL_NAME,
           messages: [...messages, userMsg].map(m => ({ role: m.role, content: m.content })),
-          max_tokens: 100,
+          max_tokens: 10000,
           stream: true // Enable streaming
         })
       });
@@ -222,7 +222,7 @@ export default function App() {
         const lines = buffer.split('\n');
         // Keep the last incomplete line in buffer
         buffer = lines.pop() || "";
-        
+
         for (const line of lines) {
           const trimmed = line.trim();
           

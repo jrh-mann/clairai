@@ -184,6 +184,11 @@ export default function App() {
   const [hoveredTokenIndex, setHoveredTokenIndex] = useState(null);
   const [numProbes, setNumProbes] = useState(0);
 
+  // Tok/s measurement
+  const [tokensPerSecond, setTokensPerSecond] = useState(0);
+  const startTimeRef = useRef(null);
+  const tokenCountRef = useRef(0);
+
   const messagesEndRef = useRef(null);
 
   const scrollToBottom = () => {
@@ -193,6 +198,22 @@ export default function App() {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  // Update tok/s periodically while streaming
+  useEffect(() => {
+    if (!isLoading || !startTimeRef.current) return;
+    
+    const interval = setInterval(() => {
+      if (startTimeRef.current && tokenCountRef.current > 0) {
+        const elapsed = (Date.now() - startTimeRef.current) / 1000;
+        if (elapsed > 0) {
+          setTokensPerSecond(tokenCountRef.current / elapsed);
+        }
+      }
+    }, 100); // Update every 100ms for smooth display
+    
+    return () => clearInterval(interval);
+  }, [isLoading]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -219,6 +240,11 @@ export default function App() {
     };
     setMessages(prev => [...prev, assistantMsg]);
 
+    // Initialize tok/s tracking
+    startTimeRef.current = Date.now();
+    tokenCountRef.current = 0;
+    setTokensPerSecond(0);
+
     try {
       console.log("[FRONTEND] Making request to:", PROXY_URL);
       const response = await fetch(PROXY_URL, {
@@ -227,7 +253,7 @@ export default function App() {
         body: JSON.stringify({
           model: MODEL_NAME,
           messages: [...messages, userMsg].map(m => ({ role: m.role, content: m.content })),
-          max_tokens: 100,
+          max_tokens: 10000,
           stream: true
         })
       });
@@ -287,9 +313,9 @@ export default function App() {
             streamDone = true;
             break;
           }
-          
-          try {
-            const data = JSON.parse(dataStr);
+            
+            try {
+              const data = JSON.parse(dataStr);
             console.log("[FRONTEND] Parsed JSON, keys:", Object.keys(data));
             
             // --- CASE A: PROBE UPDATE (Custom Event) ---
@@ -327,6 +353,15 @@ export default function App() {
             if (data.choices?.[0]?.delta?.content) {
               const tokenText = data.choices[0].delta.content;
               console.log("[FRONTEND] Processing token text:", JSON.stringify(tokenText));
+              
+              // Update token count for tok/s calculation
+              tokenCountRef.current += 1;
+              if (startTimeRef.current) {
+                const elapsed = (Date.now() - startTimeRef.current) / 1000; // seconds
+                if (elapsed > 0) {
+                  setTokensPerSecond(tokenCountRef.current / elapsed);
+                }
+              }
               
               setMessages(prev => prev.map(msg => {
                 if (msg.id !== assistantMsgId) return msg;
@@ -386,8 +421,8 @@ export default function App() {
                     return lastMsg;
                   }));
                 }
-              }
-              
+                }
+                
               // Handle text token
               if (data.choices?.[0]?.delta?.content) {
                 const tokenText = data.choices[0].delta.content;
@@ -416,6 +451,12 @@ export default function App() {
       ));
     } finally {
       setIsLoading(false);
+      // Reset tok/s after a brief delay to show final rate
+      setTimeout(() => {
+        setTokensPerSecond(0);
+        startTimeRef.current = null;
+        tokenCountRef.current = 0;
+      }, 2000);
     }
   };
 
@@ -450,6 +491,13 @@ export default function App() {
 
   return (
     <div className="flex flex-col h-screen bg-gray-50 font-sans text-gray-900">
+      
+      {/* Tok/s Display - Top Right Corner */}
+      {tokensPerSecond > 0 && (
+        <div className="fixed top-4 right-4 z-50 bg-emerald-600 text-white px-3 py-2 rounded-lg shadow-lg font-mono text-sm">
+          {tokensPerSecond.toFixed(1)} tok/s
+        </div>
+      )}
       
       {/* --- HEADER & CONTROLS --- */}
       <header className="bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between sticky top-0 z-10 shadow-sm">
@@ -535,7 +583,7 @@ export default function App() {
                       </div>
                     ) : (
                       msg.content ? (
-                        <span>{msg.content}</span>
+                      <span>{msg.content}</span>
                       ) : (
                         <span className="animate-pulse text-gray-400">Thinking...</span>
                       )

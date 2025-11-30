@@ -20,7 +20,7 @@ from typing import List, Dict, Tuple, Optional
 VLLM_URL = "http://localhost:8000/v1/chat/completions"
 IPC_PATH = "/tmp/vllm_probe.ipc"
 META_PATH = "/tmp/vllm_probe_meta.json"
-MAX_BUFFER_AGE_SEC = 30  # Cleanup unmatched streams after 30s
+MAX_BUFFER_AGE_SEC = 120  # Cleanup unmatched streams after 120s (allow for long requests)
 
 # --- SHARED STATE ---
 # Stores: root_id -> {'tokens': deque([arrays]), 'total_len': int, 'last_update': timestamp}
@@ -200,27 +200,45 @@ def get_stream_delta(root_id: Optional[int], prompt_len_est: int, last_sent_coun
         # A. If we don't have a root_id yet, find the best match
         if root_id is None:
             best_score = float('inf')
+            best_root_id = None
+            # prompt_len_est already includes expected position (prompt + generated tokens)
+            expected_len = prompt_len_est
+            now = time.time()
             candidates = list(probe_buffer.keys())
+            
             for rid in candidates:
-                # Heuristic: Match based on length proximity to prompt length
-                # We assume the stream started recently, so total_len should be close to current gen_count
-                total_len = probe_buffer[rid]['total_len']
+                stream_info = probe_buffer[rid]
+                total_len = stream_info['total_len']
+                last_update = stream_info.get('last_update', 0)
                 
-                # Check if stream is viable (has enough data to be the one)
+                # Check if stream is viable (has data and was recently updated)
                 if total_len > 0:
-                     # A match is likely if the buffer length roughly matches where we expect to be
-                     # For the first token, total_len is small.
-                    score = abs(total_len - prompt_len_est) 
-                    # Refined match: Prefer larger buffers that are close to prompt+gen
-                    if score < best_score:
-                        best_score = score
-                        root_id = rid
+                    # Prefer streams that:
+                    # 1. Have length close to what we expect
+                    # 2. Were recently updated (within last 5 seconds)
+                    age = now - last_update
+                    if age < 5.0:  # Only consider recently active streams
+                        # Score based on length proximity
+                        score = abs(total_len - expected_len)
+                        # Also prefer streams that are at least as long as we expect (not shorter)
+                        if total_len < expected_len - 10:
+                            score += 1000  # Penalize streams that are too short
+                        
+                        if score < best_score:
+                            best_score = score
+                            best_root_id = rid
+            
+            root_id = best_root_id
             
             # If no good match found or empty, return None
             if root_id is None or root_id not in probe_buffer:
                 return None, None
 
         # B. We have a root_id, check for new data
+        # Check if root_id still exists (might have been cleaned up)
+        if root_id not in probe_buffer:
+            return None, None
+        
         stream_info = probe_buffer[root_id]
         current_total_len = stream_info['total_len']
         
@@ -301,8 +319,10 @@ async def proxy_chat_completions(request: Request):
                             gen_token_count += 1
                             
                             # 2. Opportunistic Probe Update (Non-blocking)
-                            # Only try to fetch probes every few tokens to save CPU
-                            if gen_token_count % 3 == 0:
+                            # Try to fetch probes every few tokens, or if we lost the root_id
+                            should_try_probe = (gen_token_count % 3 == 0) or (matched_root_id is None)
+                            
+                            if should_try_probe:
                                 matched_root_id, delta_scores = get_stream_delta(
                                     matched_root_id, 
                                     prompt_len_est + gen_token_count, 
@@ -337,15 +357,18 @@ async def proxy_chat_completions(request: Request):
         # 3. Final Flush (Ensure we got everything)
         # Wait a tick for IPC to catch the very last token
         await asyncio.sleep(0.01)
-        _, final_delta = get_stream_delta(matched_root_id, 0, last_sent_probe_count)
         
-        if final_delta:
-            final_chunk = {
-                "type": "probe_update",
-                "probe_scores": final_delta,
-                "token_count": last_sent_probe_count + len(final_delta[0])
-            }
-            yield f"data: {json.dumps(final_chunk)}\n\n"
+        # Try to get final delta, but handle case where root_id was cleaned up
+        if matched_root_id is not None:
+            _, final_delta = get_stream_delta(matched_root_id, prompt_len_est + gen_token_count, last_sent_probe_count)
+            
+            if final_delta:
+                final_chunk = {
+                    "type": "probe_update",
+                    "probe_scores": final_delta,
+                    "token_count": last_sent_probe_count + len(final_delta[0])
+                }
+                yield f"data: {json.dumps(final_chunk)}\n\n"
 
         yield "data: [DONE]\n\n"
 
