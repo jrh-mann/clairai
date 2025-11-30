@@ -10,7 +10,8 @@ import sys
 import numpy as np
 import cupy as cp
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from collections import defaultdict, deque
 from typing import List, Dict, Tuple, Optional
@@ -177,6 +178,16 @@ async def lifespan(app: FastAPI):
     monitor.running = False
 
 app = FastAPI(lifespan=lifespan)
+
+# Add CORS middleware to handle preflight OPTIONS requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 client = httpx.AsyncClient(timeout=120.0)
 
 @app.get("/v1/models")
@@ -192,10 +203,11 @@ async def proxy_models():
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Upstream connection failed: {str(e)}"})
 
-def match_stream(gen_count: int, prompt_len_est: int) -> Optional[np.ndarray]:
+def find_matching_stream(gen_count: int, prompt_len_est: int, pop: bool = False) -> Tuple[Optional[int], Optional[np.ndarray]]:
     """
     Finds the probe stream that best matches the request dimensions.
-    Returns: Numpy array of shape (n_probes, n_output_tokens) OR None
+    Returns: (root_id, probe_data) where probe_data is shape (n_probes, n_output_tokens) OR (None, None)
+    If pop=True, removes the stream from buffer. Otherwise, leaves it for incremental updates.
     """
     best_root = None
     best_score = float('inf')
@@ -204,15 +216,10 @@ def match_stream(gen_count: int, prompt_len_est: int) -> Optional[np.ndarray]:
         candidates = list(probe_buffer.keys())
         
         for root_id in candidates:
-            # Concatenate all chunks for this stream
-            # (In production, cache this size to avoid iterating list every time)
             stream_data = probe_buffer[root_id]['tokens']
             total_probe_tokens = sum(len(chunk) for chunk in stream_data)
-            
-            # Calculate implied prefill
             calc_prefill = total_probe_tokens - gen_count
             
-            # Heuristic Match
             if calc_prefill >= 0 and calc_prefill < 2048:
                 score = abs(calc_prefill - prompt_len_est)
                 if score < best_score:
@@ -220,23 +227,26 @@ def match_stream(gen_count: int, prompt_len_est: int) -> Optional[np.ndarray]:
                     best_root = root_id
         
         if best_root is not None:
-            # Found match! Pop it (consume it) so it doesn't leak
-            data_chunks = probe_buffer.pop(best_root)['tokens']
+            data_chunks = probe_buffer[best_root]['tokens'] if not pop else probe_buffer.pop(best_root)['tokens']
             
-            # 1. Stitch chunks: (Total_Tokens, N_Probes)
             full_matrix = np.concatenate(data_chunks, axis=0)
             
-            # 2. Slice Output Tokens: Get last N rows
-            # We only want the generated tokens, not the prompt
-            if gen_count > 0:
+            if gen_count > 0 and len(full_matrix) >= gen_count:
                 output_matrix = full_matrix[-gen_count:]
+            elif gen_count > 0:
+                # Not enough tokens yet, return what we have
+                output_matrix = full_matrix
             else:
                 output_matrix = np.empty((0, full_matrix.shape[1]))
 
-            # 3. Transpose: (N_Probes, N_Output_Tokens) as requested
-            return output_matrix.T.tolist()
+            return best_root, output_matrix.T.tolist()
             
-    return None
+    return None, None
+
+def match_stream(gen_count: int, prompt_len_est: int) -> Optional[np.ndarray]:
+    """Legacy wrapper that pops the stream."""
+    _, result = find_matching_stream(gen_count, prompt_len_est, pop=True)
+    return result
 
 @app.post("/v1/chat/completions")
 async def proxy_chat_completions(request: Request):
@@ -245,76 +255,122 @@ async def proxy_chat_completions(request: Request):
     except:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # 1. Force streaming to count tokens accurately internally
-    #    (We will buffer the response before sending back to user)
-    original_stream_req = body.get("stream", False)
+    # 1. Always stream to count tokens accurately
     body["stream"] = True 
     
     # 2. Estimate Prompt Length (for matching)
-    #    Rough estimate: 4 chars per token. 
-    #    If you have the tokenizer locally, use it here for 100% accuracy.
     messages = body.get("messages", [])
     prompt_text = " ".join([m.get("content", "") for m in messages])
     prompt_len_est = len(prompt_text) // 4
 
-    # 3. Forward to vLLM
-    try:
-        async with client.stream("POST", VLLM_URL, json=body) as resp:
-            if resp.status_code != 200:
-                return JSONResponse(status_code=resp.status_code, content={"error": "vLLM Error"})
+    async def generate():
+        full_content = ""
+        gen_token_count = 0
+        token_strings = []
+        last_probe_update = 0
+        matched_root_id = None  # Track which stream we matched
+        
+        try:
+            async with client.stream("POST", VLLM_URL, json=body) as resp:
+                if resp.status_code != 200:
+                    error_msg = json.dumps({"error": "vLLM Error"})
+                    yield f"data: {error_msg}\n\n"
+                    return
 
-            # 4. Consume Stream & Buffer
-            full_content = ""
-            gen_token_count = 0
-            
-            async for line in resp.aiter_lines():
-                if line.startswith("data: ") and line != "data: [DONE]":
-                    try:
-                        chunk = json.loads(line[6:])
-                        if chunk['choices'][0]['delta'].get('content'):
-                            content = chunk['choices'][0]['delta']['content']
-                            full_content += content
-                            gen_token_count += 1 # Count generated tokens
-                    except: pass
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Upstream connection failed: {str(e)}"})
+                # Stream tokens as they arrive
+                async for line in resp.aiter_lines():
+                    if line.startswith("data: ") and line != "data: [DONE]":
+                        try:
+                            chunk = json.loads(line[6:])
+                            delta = chunk['choices'][0].get('delta') or chunk['choices'][0].get('message')
+                            if delta and delta.get('content'):
+                                content = delta['content']
+                                full_content += content
+                                gen_token_count += 1
+                                token_strings.append(content)
+                                
+                                # Stream token to frontend immediately
+                                token_chunk = {
+                                    "type": "token",
+                                    "token": content,
+                                    "index": gen_token_count - 1
+                                }
+                                yield f"data: {json.dumps(token_chunk)}\n\n"
+                                
+                                # Try to get probe data incrementally (every 5 tokens or after initial delay)
+                                if gen_token_count >= 5 and (gen_token_count - last_probe_update >= 5 or gen_token_count == 5):
+                                    await asyncio.sleep(0.005)  # Brief wait for IPC
+                                    
+                                    # Try incremental matching (don't pop, just peek)
+                                    root_id, probe_scores = find_matching_stream(gen_token_count, prompt_len_est, pop=False)
+                                    
+                                    if root_id is not None and probe_scores is not None:
+                                        if matched_root_id is None:
+                                            matched_root_id = root_id
+                                        
+                                        # Only send if we have data for current token count
+                                        if probe_scores and len(probe_scores[0]) >= gen_token_count:
+                                            # Trim to current token count
+                                            trimmed_scores = [row[:gen_token_count] for row in probe_scores]
+                                            
+                                            probe_chunk = {
+                                                "type": "probe_update",
+                                                "probe_scores": trimmed_scores,
+                                                "token_count": gen_token_count
+                                            }
+                                            yield f"data: {json.dumps(probe_chunk)}\n\n"
+                                            last_probe_update = gen_token_count
+                        except: pass
+                    
+                    # Forward [DONE] marker
+                    if line == "data: [DONE]":
+                        break
+                        
+        except Exception as e:
+            error_msg = json.dumps({"error": f"Upstream connection failed: {str(e)}"})
+            yield f"data: {error_msg}\n\n"
+            return
 
-    # 5. Wait briefly for IPC to catch up (GPU -> CPU latency)
-    #    IPC usually lags 1-2ms behind API response, but let's be safe.
-    await asyncio.sleep(0.01)
+        # Wait briefly for IPC to catch up
+        await asyncio.sleep(0.01)
 
-    # 6. Find & Attach Probe Data
-    #    We look for a stream where (Total - gen_token_count) ≈ prompt_len_est
-    probe_data = match_stream(gen_token_count, prompt_len_est)
+        # Find & Attach Final Probe Data (more accurate match)
+        probe_data = match_stream(gen_token_count, prompt_len_est)
+        
+        # If we got better data from final match, send it
+        if probe_data and matched_root_id:
+            final_probe_chunk = {
+                "type": "probe_final",
+                "probe_scores": probe_data,
+                "token_count": gen_token_count
+            }
+            yield f"data: {json.dumps(final_probe_chunk)}\n\n"
 
-    # 7. Construct Final Response
-    response_payload = {
-        "id": "chatcmpl-proxy-" + str(int(time.time())),
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": body.get("model", "unknown"),
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": full_content
-            },
-            "finish_reason": "stop"
-        }],
-        "usage": {
-            "prompt_tokens": prompt_len_est, # Approximate
-            "completion_tokens": gen_token_count,
-            "total_tokens": prompt_len_est + gen_token_count
-        },
-        # --- THE PAYLOAD YOU WANTED ---
-        "probe_scores": probe_data  # List[List[float]] shape (n_probes, n_gen_tokens)
-    }
-    
-    # If the user requested streaming, we technically broke the contract by buffering.
-    # But for probe alignment, buffering is required. We return standard JSON.
-    return JSONResponse(content=response_payload)
+        # Send final message
+        final_payload = {
+            "type": "done",
+            "content": full_content,
+            "tokens": token_strings,
+            "probe_scores": probe_data,
+            "usage": {
+                "prompt_tokens": prompt_len_est,
+                "completion_tokens": gen_token_count,
+                "total_tokens": prompt_len_est + gen_token_count
+            }
+        }
+        yield f"data: {json.dumps(final_payload)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }
+    )
 
 if __name__ == "__main__":
-    print("🚀 Starting vLLM Probe Proxy on port 8081...")
+    print("🚀 Starting vLLM Probe Proxy on port 6969...")
     print(f"   Targeting vLLM at: {VLLM_URL}")
-    uvicorn.run(app, host="0.0.0.0", port=8888)
+    uvicorn.run(app, host="0.0.0.0", port=6969)
