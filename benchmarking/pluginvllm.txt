@@ -1,6 +1,6 @@
 Benchmarking vLLM endpoint: http://localhost:8000/v1
-Model: default
-Number of requests: 100
+Model: meta-llama/Llama-3.1-8B-Instruct
+Number of requests: 50
 Concurrent requests: 10
 Max tokens: 256
 Streaming: True
@@ -10,43 +10,44 @@ Streaming: True
 BENCHMARK RESULTS
 ================================================================================
 
-Total Requests: 100
-Successful: 100
+Total Requests: 50
+Successful: 50
 Failed: 0
 
-Total Time: 87.54s
-Total Tokens Generated: 25,319
+Total Time: 43.30s
+Total Tokens Generated: 16,026
 
 --------------------------------------------------------------------------------
 THROUGHPUT (tokens/second)
 --------------------------------------------------------------------------------
-Average:  29.09 tok/s
-P50:      29.61 tok/s
-P95:      31.76 tok/s
-P99:      32.67 tok/s
+Average:  37.05 tok/s
+P50:      37.18 tok/s
+P95:      38.95 tok/s
+P99:      39.62 tok/s
 
 --------------------------------------------------------------------------------
 TIME TO FIRST TOKEN (TTFT)
 --------------------------------------------------------------------------------
-Average:  296.93 ms
-P50:      65.11 ms
-P95:      2404.42 ms
-P99:      2407.06 ms
+Average:  79.11 ms
+P50:      68.18 ms
+P95:      103.57 ms
+P99:      105.69 ms
 
 --------------------------------------------------------------------------------
 TOTAL REQUEST LATENCY
 --------------------------------------------------------------------------------
-Average:  8.751s
-P50:      8.515s
-P95:      10.919s
-P99:      10.921s
+Average:  8.652s
+P50:      8.607s
+P95:      8.819s
+P99:      8.822s
 
 --------------------------------------------------------------------------------
 OTHER METRICS
 --------------------------------------------------------------------------------
-Avg Tokens per Request: 253.2
-Avg Time per Token: 34.623 ms
-Requests per Second: 1.14
+Avg Tokens per Request: 320.5
+Avg Time per Token: 27.020 ms
+Requests per Second: 1.15
+Requests with Probe Values: 0/50 (0.0%)
 
 ================================================================================
 
