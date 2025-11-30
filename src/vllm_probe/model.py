@@ -160,41 +160,103 @@ def get_probed_class(target_model):
             layers[self.target_layer_idx].register_forward_hook(self._probe_hook)
             print(f">> [PROBE] 🪝 Hook attached to Layer {self.target_layer_idx}")
 
-        def _probe_hook(self, module, input, output):
-            """Write batch-structured probe data to IPC."""
-            
-            hidden_states = output[0] if isinstance(output, tuple) else output
-            ctx = get_forward_context()
 
+        def _probe_hook(self, module, input, output):
+            """
+            Complete Probe Hook with Stable Request Tracking (Chain Link Method).
+            Tracks requests via (Current_Block_ID, Previous_Block_ID) to handle 
+            batch shifts and prefix caching.
+            """
+            # 1. Standard Output Handling
+            hidden_states = output[0] if isinstance(output, tuple) else output
+            
+            # 2. Get vLLM Context
+            ctx = get_forward_context()
             if not ctx.attn_metadata:
                 return
+
+            # 3. Extract Metadata
+            # Access the metadata for the first layer (structure varies by vLLM version)
+            meta = next(iter(ctx.attn_metadata.values()))
             
-            # Get batch structure
-            first_layer_metadata = next(iter(ctx.attn_metadata.values()))
-            query_start_loc_gpu = first_layer_metadata. query_start_loc
+            # 4. Prepare Batch Layout Data
+            # query_start_loc defines the boundaries of requests in the flattened batch
+            query_start_loc_gpu = meta.query_start_loc
             
-            # Increment batch counter
+            # Determine actual number of requests in this specific forward pass
+            # (query_start_loc has N+1 elements for N requests)
+            num_reqs = query_start_loc_gpu.shape[0] - 1
+
+            # 5. Stable ID Calculation (The Chain Link Logic)
+            if hasattr(meta, 'block_table') and hasattr(meta, 'seq_lens'):
+                block_table = meta.block_table
+                seq_lens = meta.seq_lens
+                
+                # --- LOGIC START ---
+                # Slice to active requests (ignore padding rows if any)
+                # Ensure we are on the same device
+                active_seq_lens = seq_lens[:num_reqs]
+                active_block_table = block_table[:num_reqs]
+                
+                # Constants
+                BLOCK_SIZE = 16 # Standard vLLM block size. Adjust if using 32.
+                
+                # Calculate the index of the last utilized block for each request
+                # Formula: (seq_len + block_size - 1) // block_size - 1
+                # Note: We subtract 1 to get 0-based index
+                last_block_indices = (active_seq_lens + BLOCK_SIZE - 1) // BLOCK_SIZE - 1
+                
+                # Calculate index of the penultimate block (for the "Previous" link)
+                # Clamp to 0 to handle very short requests gracefully
+                prev_block_indices = torch.clamp(last_block_indices - 1, min=0)
+                
+                # Create a gathering index tensor for the current active batch
+                batch_indices = torch.arange(num_reqs, device=block_table.device)
+                
+                # Fetch the Physical Block IDs
+                # 1. The "Head" (Current writing location)
+                curr_ids = active_block_table[batch_indices, last_block_indices]
+                # 2. The "Tail" (Previous block, creates the chain link)
+                prev_ids = active_block_table[batch_indices, prev_block_indices]
+                
+                # Stack into [num_reqs, 2] tensor: [[curr, prev], [curr, prev], ...]
+                stable_ids = torch.stack([curr_ids, prev_ids], dim=1).to(torch.int32).contiguous()
+                # --- LOGIC END ---
+                
+            else:
+                # Fallback if metadata is missing (should not happen in standard decode)
+                print(f"!! [Probe] Missing block_table or seq_lens in metadata")
+                # Create dummy IDs [0, 0] to prevent crash, but tracking will fail
+                stable_ids = torch.zeros((num_reqs, 2), dtype=torch.int32, device=hidden_states.device)
+
+            # 6. Compute Probe Scores
+            # Increment global sequence counter
             self._batch_counter += 1
             
-            # Compute probe scores
+            # Ensure probe directions are on the correct device/dtype
             if self._probe_dirs_casted is None or self._probe_dirs_casted.dtype != hidden_states.dtype:
-                self._probe_dirs_casted = self. probe_dirs.to(
+                self._probe_dirs_casted = self.probe_dirs.to(
                     device=hidden_states.device, 
-                    dtype=hidden_states. dtype
+                    dtype=hidden_states.dtype
                 )
             
-            scores = torch.matmul(hidden_states, self._probe_dirs_casted). float(). contiguous()
+            # Matmul: [total_tokens, hidden_dim] @ [hidden_dim, num_probes]
+            scores = torch.matmul(hidden_states, self._probe_dirs_casted).float().contiguous()
             
-            # Write to IPC - all GPU tensors, no sync! 
+            # 7. Write to IPC Ring Buffer
+            # Note: This function signature must match your C++ extension
             vllm_ipc.write_batch(
-                self._batch_counter,           # batch_id (int)
-                query_start_loc_gpu,           # [num_requests + 1] GPU tensor
-                scores,                        # [num_tokens, num_probes] GPU tensor  
-                int(self. ipc_ptr),             # ring buffer base address
-                RING_SIZE,
-                self. slot_size_bytes
+                self._batch_counter,           # Sequence ID
+                query_start_loc_gpu,           # Token boundaries
+                stable_ids,                    # <--- NEW: [num_reqs, 2] Chain IDs
+                scores,                        # Probe Scores
+                int(self.ipc_ptr),             # Ring Buffer Pointer
+                RING_SIZE,                     
+                self.slot_size_bytes
             )
             
-            torch.cuda.synchronize()  # Ensure write completes before next iteration
+            # 8. Synchronize
+            # Essential to ensure data is written before the memory is overwritten next pass
+            torch.cuda.synchronize()
                     
     return ProbedModel, BaseClass, target_arch_name

@@ -93,6 +93,26 @@ class VLLMBenchmarker:
         if self.session:
             await self.session.close()
     
+    async def get_available_models(self) -> List[str]:
+        """Fetch available models from the endpoint."""
+        if not self.session:
+            raise RuntimeError("Benchmarker must be used as async context manager")
+        
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        
+        try:
+            async with self.session.get(f"{self.base_url}/models", headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    models = [model["id"] for model in data.get("data", [])]
+                    return models
+                else:
+                    return []
+        except Exception:
+            return []
+    
     async def _make_request(
         self,
         session: aiohttp.ClientSession,
@@ -131,7 +151,18 @@ class VLLMBenchmarker:
             async with session.post(url, json=payload, headers=headers) as response:
                 if response.status != 200:
                     error_text = await response.text()
-                    error = f"HTTP {response.status}: {error_text}"
+                    # Try to parse JSON error response for better error messages
+                    try:
+                        error_json = json.loads(error_text)
+                        if isinstance(error_json.get("error"), dict):
+                            error_msg = error_json["error"].get("message", error_text)
+                        elif isinstance(error_json.get("error"), str):
+                            error_msg = error_json["error"]
+                        else:
+                            error_msg = error_text
+                    except:
+                        error_msg = error_text
+                    error = f"HTTP {response.status}: {error_msg}"
                     total_time = time.time() - start_time
                     return RequestMetrics(
                         request_id=request_id,
@@ -261,8 +292,11 @@ class VLLMBenchmarker:
                     if choices:
                         message = choices[0].get('message', {})
                         content = message.get('content', '')
-                        # Check for probe values
+                        # Check for probe values in message or at top level (proxy.py returns probe_scores at top level)
                         if 'probe_values' in message or 'all_probe_values' in message:
+                            has_probe_values = True
+                        # Also check for probe_scores at top level (proxy.py format)
+                        if 'probe_scores' in data and data['probe_scores'] is not None:
                             has_probe_values = True
                         completion_tokens = len(content.split())
                         prompt_tokens = len(prompt.split())
@@ -370,7 +404,17 @@ class VLLMBenchmarker:
         failed = [m for m in metrics if m.error is not None]
         
         if not successful:
-            raise ValueError("All requests failed! Check endpoint and configuration.")
+            # Show error details to help debug
+            error_counts = {}
+            for m in failed:
+                error_msg = m.error or "Unknown error"
+                error_counts[error_msg] = error_counts.get(error_msg, 0) + 1
+            
+            error_summary = "\n".join([f"  - {msg}: {count} times" for msg, count in error_counts.items()])
+            raise ValueError(
+                f"All {len(failed)} requests failed! Check endpoint and configuration.\n"
+                f"Errors encountered:\n{error_summary}"
+            )
         
         # Extract arrays for statistics
         throughputs = [m.throughput for m in successful]
@@ -609,7 +653,7 @@ async def main():
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=1,
+        default=256,
         help="Maximum tokens to generate per request (default: 512)"
     )
     parser.add_argument(
@@ -648,8 +692,8 @@ async def main():
     parser.add_argument(
         "--proxy-url",
         type=str,
-        default="http://localhost:6969/v1",
-        help="Proxy server URL for comparison (default: http://localhost:6969/v1)"
+        default="http://localhost:8888/v1",
+        help="Proxy server URL for comparison (default: http://localhost:8888/v1)"
     )
     
     args = parser.parse_args()
@@ -670,6 +714,29 @@ async def main():
     elif len(prompts) < args.num_requests:
         # Repeat last prompt
         prompts.extend([prompts[-1]] * (args.num_requests - len(prompts)))
+    
+    # Auto-detect model if not provided or is placeholder
+    if not args.model or args.model == "default" or args.model == "your-model-name":
+        # Try to detect from the endpoint
+        test_url = args.proxy_url if args.compare else args.url
+        print(f"Attempting to auto-detect model from {test_url}...")
+        try:
+            async with VLLMBenchmarker(base_url=test_url, api_key=args.api_key) as temp_benchmarker:
+                available_models = await temp_benchmarker.get_available_models()
+                if available_models:
+                    args.model = available_models[0]
+                    print(f"✓ Auto-detected model: {args.model}")
+                    if len(available_models) > 1:
+                        print(f"  Available models: {', '.join(available_models)}")
+                else:
+                    print(f"⚠ WARNING: Could not auto-detect model from {test_url}")
+                    print("  Please specify --model explicitly or ensure the endpoint is accessible.")
+                    if not args.model or args.model == "your-model-name":
+                        print("  Attempting to continue with model name from endpoint...")
+        except Exception as e:
+            print(f"⚠ WARNING: Failed to auto-detect model: {e}")
+            print("  Please specify --model explicitly.")
+        print()
     
     if args.compare:
         # Comparison mode: run both direct and proxy benchmarks
