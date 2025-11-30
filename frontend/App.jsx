@@ -98,8 +98,8 @@ const ProbeGraph = ({ data, selectedProbe, hoveredIndex, setHoveredIndex, numPro
             }}
           />
           
-          {/* Render faint lines for context (first 5 probes only to save perfo if N is huge) */}
-          {Array.from({ length: Math.min(numProbes, 5) }).map((_, i) => 
+          {/* Render faint lines for context (all probes except selected) */}
+          {Array.from({ length: numProbes }).map((_, i) => 
             i !== selectedProbe ? (
               <Line 
                 key={i} 
@@ -281,9 +281,12 @@ export default function App() {
                      lastMsg.scores = deltaScores;
                    } else {
                      // Append new columns to existing rows
-                     lastMsg.scores = lastMsg.scores.map((row, probeIdx) => {
+                     // Handle case where deltaScores might have more probes than existing scores
+                     const maxProbes = Math.max(lastMsg.scores.length, deltaScores.length);
+                     lastMsg.scores = Array.from({ length: maxProbes }, (_, probeIdx) => {
+                       const existingRow = lastMsg.scores[probeIdx] || [];
                        const newCols = deltaScores[probeIdx] || [];
-                       return [...row, ...newCols];
+                       return [...existingRow, ...newCols];
                      });
                    }
                    
@@ -361,9 +364,12 @@ export default function App() {
                     if (!lastMsg.scores || lastMsg.scores.length === 0) {
                       lastMsg.scores = deltaScores;
                     } else {
-                      lastMsg.scores = lastMsg.scores.map((row, probeIdx) => {
+                      // Handle case where deltaScores might have more probes than existing scores
+                      const maxProbes = Math.max(lastMsg.scores.length, deltaScores.length);
+                      lastMsg.scores = Array.from({ length: maxProbes }, (_, probeIdx) => {
+                        const existingRow = lastMsg.scores[probeIdx] || [];
                         const newCols = deltaScores[probeIdx] || [];
-                        return [...row, ...newCols];
+                        return [...existingRow, ...newCols];
                       });
                     }
                     newHistory[newHistory.length - 1] = lastMsg;

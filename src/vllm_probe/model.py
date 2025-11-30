@@ -43,8 +43,9 @@ def load_probes_for_layer(layer_idx: int):
                 probe_tensors.append(tensor)
                 bias = data.get("encoder_bias", 0.0)
                 probe_biases_list.append(bias)
-                # Naive naming
-                probe_names.append(f"probe_{len(probe_names)}")
+                # Extract feature ID from filename (e.g., enc_19_56479.json -> 56479)
+                feature_id = filepath.replace('.json', '').split('_')[-1]
+                probe_names.append(feature_id)
         except:
             continue
     
